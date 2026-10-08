@@ -1,5 +1,6 @@
 """Разовая проверка источников цен на поезда (удалить после проверки)."""
 import io
+import signal
 import json
 import sys
 import urllib.request
@@ -11,7 +12,22 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
+def _alarm(signum, frame):
+    raise TimeoutError("hard timeout")
+
+
+signal.signal(signal.SIGALRM, _alarm)
+
+
 def req(url, body=None, headers=None, raw=False):
+    signal.alarm(25)
+    try:
+        return _req(url, body, headers, raw)
+    finally:
+        signal.alarm(0)
+
+
+def _req(url, body=None, headers=None, raw=False):
     h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*"}
     h.update(headers or {})
     data = None
@@ -20,7 +36,7 @@ def req(url, body=None, headers=None, raw=False):
         h["Content-Type"] = "application/json"
     r = urllib.request.Request(url, data=data, headers=h, method="POST" if body is not None else "GET")
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with urllib.request.urlopen(r, timeout=15) as resp:
             b = resp.read()
             return resp.status, b if raw else b.decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
