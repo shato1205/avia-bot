@@ -28,6 +28,7 @@ STATE = ROOT / "data" / "state.json"
 HISTORY = ROOT / "data" / "history.json"
 SENT = ROOT / "data" / "sent.json"
 
+MSK = timezone(timedelta(hours=3))
 PRICES_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 PLACES_URL = "https://autocomplete.travelpayouts.com/places2"
 
@@ -161,7 +162,8 @@ def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=Tr
 def route_offers(token, origin, route, cfg):
     offers = []
     for month in months(cfg["months_ahead"]):
-        offers += fetch_cheapest(token, origin, route["destination"], month)
+        offers += fetch_cheapest(token, origin, route["destination"], month,
+                                 direct=route.get("direct", False))
     return offers
 
 
@@ -207,14 +209,27 @@ def format_alert(route, offer, reason, origin_name):
     )
 
 
+def alert_buttons(item):
+    return [[("⚙️ Настроить", f"i:{item['id']}"), ("⏸ Пауза", f"iz:{item['id']}")]]
+
+
+def remember_price(item, offers, now):
+    if offers:
+        item["last_price"] = min(o["price"] for o in offers)
+        item["last_ts"] = now.isoformat()
+
+
 def check_prices(tg, token, cfg, settings, history, sent, now):
     alerts = 0
     for route in settings["routes"]:
+        if route.get("paused"):
+            continue
         origin = route["origin"]
         key = f"{origin}-{route['destination']}"
         offers = route_offers(token, origin, route, cfg)
         if not offers:
             continue
+        remember_price(route, offers, now)
 
         route_history = history.get(key, [])
         deals = sorted(find_deals(route, offers, route_history, cfg, now), key=lambda d: d[0]["price"])
@@ -225,7 +240,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             last = sent.get(sent_key)
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
-            tg.send(format_alert(route, o, reason, route["origin_name"]))
+            tg.send(format_alert(route, o, reason, route["origin_name"]), alert_buttons(route))
             sent[sent_key] = now.isoformat()
             alerts += 1
 
@@ -240,8 +255,12 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             settings["filters"].remove(f)
             tg.send(f"⌛ Даты прошли, убрал подбор: {filter_text(f)}")
             continue
+        if f.get("paused"):
+            continue
         origin = f["origin"]
-        offers = [o for o in filter_offers(token, origin, f) if o["price"] <= f["max_price"]]
+        all_offers = filter_offers(token, origin, f)
+        remember_price(f, all_offers, now)
+        offers = [o for o in all_offers if o["price"] <= f["max_price"]]
         if not offers:
             continue
         o = min(offers, key=lambda x: x["price"])
@@ -252,7 +271,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         kind = " туда-обратно" if f.get("round_trip") else ""
         tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
                 f"{offer_line(o, f['origin_name'], f)}\n"
-                f"Подбор: {filter_text(f)}")
+                f"Подбор: {filter_text(f)}", alert_buttons(f))
         sent[sent_key] = now.isoformat()
         alerts += 1
     print(f"Отправлено алертов: {alerts}")
@@ -321,6 +340,8 @@ MONTH_FORMS = {
     11: "ноябрь ноября ноябре ноя", 12: "декабрь декабря декабре дек",
 }
 MONTHS = {form: num for num, forms in MONTH_FORMS.items() for form in forms.split()}
+MONTH_NOM = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август",
+             "сентябрь", "октябрь", "ноябрь", "декабрь"]
 MONTH_IN = ["", "январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе",
             "сентябре", "октябре", "ноябре", "декабре"]
 
@@ -384,6 +405,15 @@ def parse_filter(text, today):
     else:
         return None, "Укажи даты или месяц. Пример: Пхукет 15.12-25.12 до 60000"
     return city, f
+
+
+def dates_text(f):
+    def fmt(d):
+        return f"{d[8:]}.{d[5:7]}" if len(d) == 10 else "в " + MONTH_IN[int(d[5:])]
+    text = f"вылет {fmt(f['depart'])}"
+    if f.get("return"):
+        text += f", обратно {fmt(f['return'])}"
+    return text
 
 
 def filter_text(f):
@@ -512,23 +542,30 @@ SERVE = "--serve" in sys.argv
 if not SERVE:
     HELP += "\n\nЯ отвечаю не мгновенно, а при очередной проверке (раз в ~30 минут)."
 
-ADD_PROMPT = ("Напиши город и максимальную цену:\n"
-              "• Пхукет 20000\n"
-              "• Пхукет 20000, Бали 35000 — у каждого своя цена\n"
-              "• Пхукет, Бангкок, Нячанг 25000 — одна цена на всех\n"
-              "Без цены сообщу только о резком падении.")
-FILTER_PROMPT = ("Напиши город, даты и максимальную цену за билет:\n"
-                 "• Пхукет 15.12-25.12 до 60000 — туда-обратно\n"
-                 "• Стамбул 20.11 до 8000 — в одну сторону\n"
-                 "• Бали декабрь до 70000 — туда-обратно, вылет в декабре\n"
-                 "• Пхукет, Бангкок 15.12-25.12 до 60000 — несколько городов\n"
-                 "Добавь «прямой», если нужны рейсы без пересадок.")
+# ---------- Популярные города (для кнопок) ----------
 
+POPULAR_ORIGINS = [("MOW", "Москва"), ("LED", "Санкт-Петербург"), ("KZN", "Казань"),
+                   ("SVX", "Екатеринбург"), ("OVB", "Новосибирск"), ("AER", "Сочи"),
+                   ("KRR", "Краснодар"), ("KUF", "Самара"), ("UFA", "Уфа")]
+POPULAR_DESTINATIONS = [
+    ("HKT", "Пхукет", "Таиланд"), ("BKK", "Бангкок", "Таиланд"), ("DPS", "Бали", "Индонезия"),
+    ("CXR", "Нячанг", "Вьетнам"), ("DXB", "Дубай", "ОАЭ"), ("AYT", "Анталья", "Турция"),
+    ("IST", "Стамбул", "Турция"), ("HRG", "Хургада", "Египет"), ("MLE", "Мальдивы", "Мальдивы"),
+    ("EVN", "Ереван", "Армения"), ("TBS", "Тбилиси", "Грузия"), ("AER", "Сочи", "Россия"),
+]
+ROUTE_PRICES = [5000, 10000, 15000, 20000, 25000, 30000, 40000, 50000, 70000]
+FILTER_PRICES = [10000, 20000, 30000, 40000, 50000, 60000, 80000, 100000, 150000]
 
-# ---------- Экраны меню ----------
+ADD_HINT = ("Можно и одной строкой: «Пхукет 20000, Бали 35000» "
+            "или «Пхукет, Бангкок 25000» — одна цена на всех.")
+
 
 def k(n):
-    return f"{round(n / 1000)}к" if n >= 1000 else str(n)
+    return f"{n / 1000:g}к" if n >= 1000 else str(n)
+
+
+def rows(buttons, per_row):
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
 
 
 def items_of(settings, code):
@@ -540,60 +577,185 @@ def origin_name(settings, code):
     return next((o["name"] for o in settings["origins"] if o["code"] == code), code)
 
 
+def find_item(settings, item_id):
+    for kind, key in (("route", "routes"), ("filter", "filters")):
+        for item in settings.get(key, []):
+            if item["id"] == item_id:
+                return kind, item
+    return None, None
+
+
+def short_dates(f):
+    def one(d):
+        return f"{d[8:]}.{d[5:7]}" if len(d) == 10 else MONTH_NOM[int(d[5:])]
+    text = one(f["depart"])
+    if f.get("return"):
+        text += "–" + one(f["return"])
+    return text
+
+
+def item_label(kind, item):
+    pause = "⏸ " if item.get("paused") else ""
+    last = f" · сейчас {k(item['last_price'])}" if item.get("last_price") else ""
+    if kind == "route":
+        limit = f"до {k(item['max_price'])}" if item.get("max_price") else "падения"
+        return f"{pause}📍 {item['city']} · {limit}{last}"
+    return f"{pause}🎯 {item['city']} {short_dates(item)} · до {k(item['max_price'])}{last}"
+
+
+def new_item_fields(settings, place):
+    return {"name": place_name(place), "city": place["name"], "destination": place["code"],
+            "origin": settings["origin"], "origin_name": settings["origin_name"],
+            "id": uuid.uuid4().hex[:8]}
+
+
+def parse_dates(text, today):
+    """«15.12-25.12», «20.11», «декабрь» → поля дат подбора или строка-ошибка."""
+    city, f = parse_filter(f"город {text} до 1", today)
+    if city is None:
+        return f.replace("Пхукет ", "").replace(" до 60000", "")
+    f.pop("max_price")
+    return f
+
+
+def parse_amount(text):
+    m = re.match(r"^\s*(\d[\d\s]*)\s*(к|k|тыс\.?)?\s*(₽|р|руб\.?)?\s*$", text, re.I)
+    if not m:
+        return None
+    n = int(m.group(1).replace(" ", ""))
+    return n * 1000 if m.group(2) else n
+
+
+# ---------- Экраны ----------
+
 def home_screen(settings):
-    lines = ["✈️ Главное меню\n", "Выбери город вылета, чтобы посмотреть и настроить направления:"]
+    lines = ["✈️ Главное меню\n"]
     buttons = []
     for o in settings["origins"]:
         items = items_of(settings, o["code"])
-        n_routes = sum(1 for kind, _ in items if kind == "route")
-        n_filters = len(items) - n_routes
-        lines.append(f"🛫 {o['name']}: направлений {n_routes}, подборов {n_filters}")
-        buttons.append([(f"🛫 {o['name']}", f"o:{o['code']}")])
-    buttons.append([("➕ Добавить город вылета", "neworigin")])
-    buttons.append([("💰 Цены по всем городам", "pa")])
+        n_r = sum(1 for kind, _ in items if kind == "route")
+        lines.append(f"🛫 {o['name']}: направлений {n_r}, подборов {len(items) - n_r}")
+        buttons.append([(f"🛫 {o['name']}  ({len(items)})", f"o:{o['code']}")])
+    if not settings["origins"]:
+        lines.append("Пока нет городов вылета.")
+    lines.append("\nНажми на город вылета, чтобы настроить направления.")
+    buttons.append([("➕ Город вылета", "no"), ("💰 Все цены", "pa")])
     return "\n".join(lines), buttons
 
 
 def origin_screen(settings, code):
     name = origin_name(settings, code)
     items = items_of(settings, code)
-    routes = [r for kind, r in items if kind == "route"]
-    filters = [f for kind, f in items if kind == "filter"]
-    lines = [f"🛫 Вылет: {name}\n", "📍 Направления — сообщу, когда билет подешевеет:"]
-    for r in routes:
-        limit = f"до {fmt_price(r['max_price'])} ₽" if r.get("max_price") else "резкие падения"
-        lines.append(f"• {r['name']} — {limit}")
-    if not routes:
-        lines.append("пока нет")
-    lines.append("\n🎯 Подборы по датам:")
-    for f in filters:
-        lines.append("• " + filter_text(f))
-    if not filters:
-        lines.append("пока нет")
-    buttons = [
+    lines = [f"🛫 Вылет: {name}\n"]
+    if items:
+        lines.append("📍 — сообщу, когда цена упадёт ниже порога\n"
+                     "🎯 — подбор на конкретные даты\n"
+                     "Нажми на направление, чтобы изменить его.")
+    else:
+        lines.append("Направлений пока нет. Добавь первое кнопкой ниже 👇")
+    buttons = [[(item_label(kind, item), f"i:{item['id']}")] for kind, item in items]
+    buttons += [
         [("➕ Направление", f"a:{code}"), ("🎯 Подбор по датам", f"f:{code}")],
-        [("💰 Цены сейчас", f"p:{code}"), ("🗑 Удалить", f"d:{code}")],
+        [("💰 Цены сейчас", f"p:{code}"), ("🗑 Удалить город", f"xq:{code}")],
         [("⬅️ Все города", "home")],
     ]
     return "\n".join(lines), buttons
 
 
-def delete_screen(settings, code):
-    name = origin_name(settings, code)
-    buttons = []
-    for kind, item in items_of(settings, code):
-        if kind == "route":
-            label = f"❌ {item['city']}" + (f" до {k(item['max_price'])}" if item.get("max_price") else "")
-        else:
-            dates = item["depart"][8:] + "." + item["depart"][5:7] if len(item["depart"]) == 10 \
-                else "в " + MONTH_IN[int(item["depart"][5:])]
-            if item.get("return") and len(item["return"]) == 10:
-                dates += f"–{item['return'][8:]}.{item['return'][5:7]}"
-            label = f"❌ 🎯 {item['city']} {dates} до {k(item['max_price'])}"
-        buttons.append([(label[:60], f"r:{item['id']}")])
-    buttons.append([(f"🗑 Удалить город {name} целиком", f"x:{code}")])
-    buttons.append([("⬅️ Назад", f"o:{code}")])
-    return f"🗑 Вылет: {name}\nНажми на то, что нужно удалить:", buttons
+def item_screen(settings, item_id, note=""):
+    kind, item = find_item(settings, item_id)
+    if not item:
+        return home_screen(settings)
+    i = item["id"]
+    lines = [note] if note else []
+    if kind == "route":
+        country = item["name"].split(" (")[0].title() if " (" in item["name"] else ""
+        lines.append(f"📍 {item['origin_name']} → {item['city']}" + (f" ({country})" if country else ""))
+        lines.append(f"Сообщу, когда билет дешевле {fmt_price(item['max_price'])} ₽ "
+                     "или резко подешевеет." if item.get("max_price")
+                     else "Сообщу, когда билет резко подешевеет.")
+    else:
+        trip = "туда-обратно" if item.get("round_trip") else "в одну сторону"
+        lines.append(f"🎯 {item['origin_name']} → {item['city']}, {trip}")
+        lines.append("Даты: " + dates_text(item))
+        lines.append(f"Сообщу, когда билет дешевле {fmt_price(item['max_price'])} ₽.")
+    if item.get("last_price"):
+        ts = datetime.fromisoformat(item["last_ts"]).astimezone(MSK).strftime("%d.%m %H:%M")
+        lines.append(f"Последняя цена: {fmt_price(item['last_price'])} ₽ (мск {ts})")
+    lines.append("Только прямые рейсы ✈️" if item.get("direct") else "С пересадками тоже")
+    lines.append("⏸ На паузе: не присылаю уведомления" if item.get("paused") else "✅ Слежу")
+
+    buttons = [
+        [("− 5к", f"ip:{i}:-5000"), ("− 1к", f"ip:{i}:-1000"),
+         ("+ 1к", f"ip:{i}:1000"), ("+ 5к", f"ip:{i}:5000")],
+        [("✏️ Своя цена", f"it:{i}")],
+    ]
+    if kind == "filter":
+        trip_btn = "🔁 Сделать в одну сторону" if item.get("round_trip") else "🔁 Сделать туда-обратно"
+        row = [("📅 Изменить даты", f"id:{i}")]
+        if not item.get("return"):
+            row.append((trip_btn, f"ir:{i}"))
+        buttons.append(row)
+    buttons += [
+        [("✈️ Только прямые: " + ("вкл" if item.get("direct") else "выкл"), f"ic:{i}"),
+         ("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
+        [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
+        [(f"⬅️ {item['origin_name']}", f"o:{item['origin']}")],
+    ]
+    return "\n".join(lines), buttons
+
+
+def pick_city_screen(settings, kind):
+    what = "Направление" if kind == "r" else "Подбор по датам"
+    text = (f"{what} из города {settings['origin_name']}.\n\nКуда летим? "
+            "Нажми на город или напиши свой.")
+    if kind == "r":
+        text += "\n\n" + ADD_HINT
+    btns = [(name, f"wc:{code}") for code, name, _ in POPULAR_DESTINATIONS
+            if code != settings["origin"]]
+    return text, rows(btns, 3) + [[("⬅️ Отмена", f"o:{settings['origin']}")]]
+
+
+def pick_dates_screen(wiz):
+    today = date.today()
+    btns = []
+    d = today.replace(day=1)
+    for _ in range(6):
+        btns.append((MONTH_NOM[d.month].capitalize(), f"wm:{d.strftime('%Y-%m')}"))
+        d = (d + timedelta(days=32)).replace(day=1)
+    text = (f"🎯 {wiz['city']}: когда летим?\n\n"
+            "Выбери месяц или напиши точные даты:\n"
+            "• 15.12-25.12 — туда-обратно\n"
+            "• 20.11 — один день вылета")
+    return text, rows(btns, 3) + [[("⬅️ Отмена", f"o:{wiz['origin']}")]]
+
+
+def pick_trip_screen(wiz):
+    return (f"🎯 {wiz['city']}: билет нужен туда-обратно или в одну сторону?",
+            [[("🔁 Туда-обратно", "wt:rt"), ("➡️ В одну сторону", "wt:ow")],
+             [("⬅️ Отмена", f"o:{wiz['origin']}")]])
+
+
+def pick_price_screen(wiz, current=None):
+    prices = ROUTE_PRICES if wiz["kind"] == "r" else FILTER_PRICES
+    what = "билет" if wiz["kind"] == "r" else (
+        "билеты туда-обратно" if wiz.get("round_trip") else "билет")
+    text = f"{wiz['city']}: при какой цене за {what} прислать уведомление?"
+    if current:
+        text += f"\n\nСейчас самый дешёвый: {fmt_price(current)} ₽"
+    text += "\n\nВыбери порог или напиши свою сумму, например 23500."
+    btns = [(f"до {k(p)}", f"wp:{p}") for p in prices]
+    buttons = rows(btns, 3)
+    if wiz["kind"] == "r":
+        buttons.append([("Без порога — только резкие падения", "wp:0")])
+    buttons.append([("⬅️ Отмена", f"o:{wiz['origin']}")])
+    return text, buttons
+
+
+def pick_origin_screen():
+    btns = [(name, f"po:{code}") for code, name in POPULAR_ORIGINS]
+    return ("Откуда будешь улетать? Нажми на город или напиши свой.",
+            rows(btns, 3) + [[("⬅️ Отмена", "home")]])
 
 
 def back_button(settings, code):
@@ -602,19 +764,76 @@ def back_button(settings, code):
     return [[("⬅️ В меню", "home")]]
 
 
-# ---------- Обработка сообщений и кнопок ----------
+# ---------- Мастер добавления ----------
+
+def wizard_current_price(token, cfg, settings, wiz):
+    try:
+        if wiz["kind"] == "r":
+            offers = route_offers(token, settings["origin"], {"destination": wiz["dest"]}, cfg)
+        else:
+            offers = filter_offers(token, settings["origin"], dict(wiz, destination=wiz["dest"]))
+    except Exception as e:  # noqa: BLE001
+        print(f"price error: {e}", file=sys.stderr)
+        return None
+    return min((o["price"] for o in offers), default=None)
+
+
+def wizard_set_city(state, settings, place):
+    wiz = state.setdefault("wiz", {})
+    wiz.update(dest=place["code"], city=place["name"], country=place["country"])
+
+
+def wizard_next(state, settings, tg, token, cfg, message_id=None):
+    """Показывает следующий шаг мастера (или создаёт направление на последнем шаге)."""
+    wiz = state["wiz"]
+    show = (lambda t, b: tg.edit(message_id, t, b)) if message_id else tg.send
+    if wiz["kind"] == "f" and "depart" not in wiz:
+        state["awaiting"] = {"type": "wiz_dates"}
+        return show(*pick_dates_screen(wiz))
+    if wiz["kind"] == "f" and "round_trip" not in wiz:
+        return show(*pick_trip_screen(wiz))
+    if "price" not in wiz:
+        state["awaiting"] = {"type": "wiz_price"}
+        return show(*pick_price_screen(wiz, wizard_current_price(token, cfg, settings, wiz)))
+
+    place = {"code": wiz["dest"], "name": wiz["city"], "country": wiz.get("country", "")}
+    item = new_item_fields(settings, place)
+    if wiz["kind"] == "r":
+        item["max_price"] = wiz["price"] or None
+        settings["routes"] = [r for r in settings["routes"]
+                              if not (r["destination"] == item["destination"]
+                                      and r["origin"] == item["origin"])]
+        settings["routes"].append(item)
+    else:
+        item.update(max_price=wiz["price"], depart=wiz["depart"], round_trip=wiz["round_trip"],
+                    direct=wiz.get("direct", False))
+        if wiz.get("return"):
+            item["return"] = wiz["return"]
+        settings["filters"].append(item)
+    state.pop("wiz", None)
+    state.pop("awaiting", None)
+    state["changed"] = True
+    show(*item_screen(settings, item["id"], "✅ Добавлено! Я уже проверяю цены.\n"))
+
+
+# ---------- Обработка сообщений ----------
 
 def handle(text, state, settings, tg, token, cfg):
     """Обрабатывает текстовое сообщение. Возвращает True, если появились новые направления."""
     text = text.strip()
     low = text.lower()
     awaiting = state.pop("awaiting", None)
+    if isinstance(awaiting, str):
+        awaiting = {"type": awaiting}
+    awaiting = awaiting or {}
 
     if low in ("/start", "/help", "помощь"):
+        state.pop("wiz", None)
         tg.send(HELP)
         tg.send(*home_screen(settings))
         return False
     if low in ("меню", "/menu") or text == BTN_HOME or text in OLD_BUTTONS:
+        state.pop("wiz", None)
         tg.send(*home_screen(settings))
         return False
     if text == BTN_PRICES:
@@ -624,12 +843,74 @@ def handle(text, state, settings, tg, token, cfg):
 
     for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("подбор ", "filter")):
         if low.startswith(prefix):
-            awaiting, text = action, text[len(prefix):]
+            awaiting, text = {"type": action}, text[len(prefix):]
+            state.pop("wiz", None)
             break
 
+    kind = awaiting.get("type")
+    wiz = state.get("wiz")
+
+    if kind == "wiz_city" and wiz:
+        if re.search(r"\d", text) or "," in text:
+            # Всё одной строкой: «Пхукет 20000, Бали 35000» или «Пхукет 15.12-25.12 до 60000».
+            state.pop("wiz", None)
+            kind = "add" if wiz["kind"] == "r" else "filter"
+        else:
+            place = find_place(text)
+            if isinstance(place, str):
+                state["awaiting"] = awaiting
+                tg.send(place)
+                return False
+            wizard_set_city(state, settings, place)
+            wizard_next(state, settings, tg, token, cfg)
+            return False
+    if kind == "wiz_dates" and wiz:
+        fields = parse_dates(text, date.today())
+        if isinstance(fields, str):
+            state["awaiting"] = awaiting
+            tg.send(fields)
+            return False
+        wiz.update(fields)
+        if not fields.get("return") and len(fields["depart"]) == 10:
+            wiz.pop("round_trip", None)  # один день: спросим, нужен ли обратный билет
+        wizard_next(state, settings, tg, token, cfg)
+        return False
+    if kind == "wiz_price" and wiz:
+        amount = parse_amount(text)
+        if not amount:
+            state["awaiting"] = awaiting
+            tg.send("Напиши сумму цифрами, например 23500 или 25к.")
+            return False
+        wiz["price"] = amount
+        wizard_next(state, settings, tg, token, cfg)
+        return state.pop("changed", False)
+    if kind in ("item_price", "item_dates"):
+        _, item = find_item(settings, awaiting.get("id"))
+        if not item:
+            tg.send(*home_screen(settings))
+            return False
+        if kind == "item_price":
+            amount = parse_amount(text)
+            if not amount:
+                state["awaiting"] = awaiting
+                tg.send("Напиши сумму цифрами, например 23500 или 25к.")
+                return False
+            item["max_price"] = amount
+        else:
+            fields = parse_dates(text, date.today())
+            if isinstance(fields, str):
+                state["awaiting"] = awaiting
+                tg.send(fields)
+                return False
+            item.pop("return", None)
+            fields.setdefault("round_trip", item.get("round_trip", True))
+            item.update(fields)
+        tg.send(*item_screen(settings, item["id"], "✅ Сохранил.\n"))
+        return True
+
     actions = {"origin": set_origin, "add": add_route, "filter": add_filter}
-    if awaiting in actions:
-        reply, changed = actions[awaiting](settings, text)
+    if kind in actions:
+        reply, changed = actions[kind](settings, text)
         tg.send(reply)
         if "✅" in reply:
             tg.send(*origin_screen(settings, settings["origin"]))
@@ -640,44 +921,122 @@ def handle(text, state, settings, tg, token, cfg):
 
 
 def handle_button(data, message_id, state, settings, tg, token, cfg):
-    """Обрабатывает нажатие кнопки под сообщением."""
-    state.pop("awaiting", None)
+    """Обрабатывает нажатие кнопки под сообщением. Возвращает True, если стоит проверить цены."""
     cmd, _, arg = data.partition(":")
+    if not cmd.startswith("w"):
+        state.pop("awaiting", None)
+        state.pop("wiz", None)
+    edit = lambda t, b: tg.edit(message_id, t, b)  # noqa: E731
+
     if cmd == "home":
-        tg.edit(message_id, *home_screen(settings))
+        edit(*home_screen(settings))
     elif cmd == "o" and select_origin(settings, arg):
-        tg.edit(message_id, *origin_screen(settings, arg))
-    elif cmd == "a" and select_origin(settings, arg):
-        state["awaiting"] = "add"
-        tg.send(f"🛫 Вылет: {settings['origin_name']}\n" + ADD_PROMPT, back_button(settings, arg))
-    elif cmd == "f" and select_origin(settings, arg):
-        state["awaiting"] = "filter"
-        tg.send(f"🛫 Вылет: {settings['origin_name']}\n" + FILTER_PROMPT, back_button(settings, arg))
-    elif cmd == "neworigin":
-        state["awaiting"] = "origin"
-        tg.send("Напиши город, откуда хочешь улетать, например: Казань", back_button(settings, None))
-    elif cmd in ("p", "pa"):
-        tg.send("🔎 Ищу цены…")
-        tg.send(prices_now(token, cfg, settings, arg or None), back_button(settings, arg or None))
-    elif cmd == "d":
-        tg.edit(message_id, *delete_screen(settings, arg))
-    elif cmd == "r":
-        for key in ("routes", "filters"):
-            for item in settings[key]:
-                if item["id"] == arg:
-                    settings[key].remove(item)
-                    tg.edit(message_id, *delete_screen(settings, item["origin"]))
-                    return
-        tg.edit(message_id, *home_screen(settings))
+        edit(*origin_screen(settings, arg))
+
+    # Город вылета
+    elif cmd == "no":
+        state["awaiting"] = {"type": "origin"}
+        edit(*pick_origin_screen())
+    elif cmd == "po":
+        name = dict(POPULAR_ORIGINS).get(arg, arg)
+        if not any(o["code"] == arg for o in settings["origins"]):
+            settings["origins"].append({"code": arg, "name": name})
+        select_origin(settings, arg)
+        edit(*origin_screen(settings, arg))
+    elif cmd == "xq":
+        edit(f"Удалить город {origin_name(settings, arg)} и все его направления?",
+             [[("🗑 Да, удалить", f"x:{arg}"), ("Отмена", f"o:{arg}")]])
     elif cmd == "x":
         settings["routes"] = [r for r in settings["routes"] if r["origin"] != arg]
         settings["filters"] = [f for f in settings["filters"] if f["origin"] != arg]
         settings["origins"] = [o for o in settings["origins"] if o["code"] != arg]
         if settings["origin"] == arg and settings["origins"]:
             select_origin(settings, settings["origins"][0]["code"])
-        tg.edit(message_id, *home_screen(settings))
+        edit(*home_screen(settings))
+
+    # Мастер добавления
+    elif cmd in ("a", "f") and select_origin(settings, arg):
+        state["wiz"] = {"kind": "r" if cmd == "a" else "f", "origin": arg}
+        state["awaiting"] = {"type": "wiz_city"}
+        edit(*pick_city_screen(settings, state["wiz"]["kind"]))
+    elif cmd == "wc" and state.get("wiz"):
+        code, name, country = next(d for d in POPULAR_DESTINATIONS if d[0] == arg)
+        wizard_set_city(state, settings, {"code": code, "name": name, "country": country})
+        wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wm" and state.get("wiz"):
+        state["wiz"]["depart"] = arg
+        wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wt" and state.get("wiz"):
+        state["wiz"]["round_trip"] = arg == "rt"
+        wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wp" and state.get("wiz"):
+        state["wiz"]["price"] = int(arg)
+        wizard_next(state, settings, tg, token, cfg, message_id)
+        return state.pop("changed", False)
+    elif cmd.startswith("w"):
+        edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
+
+    # Карточка направления
+    elif cmd in ("i", "ip", "it", "id", "ir", "ic", "iz", "in", "iq", "ix"):
+        item_id, _, extra = arg.partition(":")
+        kind, item = find_item(settings, item_id)
+        if not item:
+            edit("Этого направления уже нет.", back_button(settings, None))
+            return False
+        select_origin(settings, item["origin"])
+        note = ""
+        if cmd == "ip":
+            base = item.get("max_price") or item.get("last_price") or 20000
+            item["max_price"] = max(1000, base + int(extra))
+            note = f"✅ Порог: {fmt_price(item['max_price'])} ₽\n"
+        elif cmd == "it":
+            state["awaiting"] = {"type": "item_price", "id": item_id}
+            tg.send(f"{item['city']}: напиши новую цену, например 23500 или 25к.",
+                    [[("⬅️ Отмена", f"i:{item_id}")]])
+            return False
+        elif cmd == "id":
+            state["awaiting"] = {"type": "item_dates", "id": item_id}
+            tg.send(f"🎯 {item['city']}: напиши новые даты, например 15.12-25.12, 20.11 или декабрь.",
+                    [[("⬅️ Отмена", f"i:{item_id}")]])
+            return False
+        elif cmd == "ir":
+            item["round_trip"] = not item.get("round_trip")
+        elif cmd == "ic":
+            item["direct"] = not item.get("direct")
+        elif cmd == "iz":
+            item["paused"] = not item.get("paused")
+            note = "⏸ Поставил на паузу.\n" if item["paused"] else "▶️ Снова слежу.\n"
+        elif cmd == "in":
+            tg.send("🔎 Ищу цены…")
+            offers = (route_offers(token, item["origin"], item, cfg) if kind == "route"
+                      else filter_offers(token, item["origin"], item))
+            remember_price(item, offers, datetime.now(timezone.utc))
+            if offers:
+                best = min(offers, key=lambda o: o["price"])
+                tg.send(f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n"
+                        f"{offer_line(best, item['origin_name'], item)}",
+                        [[("⬅️ К направлению", f"i:{item_id}")]])
+            else:
+                tg.send(f"{item['city']}: билетов не нашёл 😔", [[("⬅️ К направлению", f"i:{item_id}")]])
+            return False
+        elif cmd == "iq":
+            edit(f"Удалить {item_label(kind, item)}?",
+                 [[("🗑 Да, удалить", f"ix:{item_id}"), ("Отмена", f"i:{item_id}")]])
+            return False
+        elif cmd == "ix":
+            settings["routes" if kind == "route" else "filters"].remove(item)
+            edit(*origin_screen(settings, item["origin"]))
+            return False
+        edit(*item_screen(settings, item_id, note))
+        return cmd in ("ip", "ir", "ic")
+
+    # Цены
+    elif cmd in ("p", "pa"):
+        tg.send("🔎 Ищу цены…")
+        tg.send(prices_now(token, cfg, settings, arg or None), back_button(settings, arg or None))
     else:
-        tg.edit(message_id, *home_screen(settings))
+        edit(*home_screen(settings))
+    return False
 
 
 def process_messages(tg, token, cfg, settings, state, wait=0):
@@ -692,12 +1051,13 @@ def process_messages(tg, token, cfg, settings, state, wait=0):
         try:
             if cq:
                 tg.answer(cq["id"])
-                handle_button(cq.get("data", ""), msg["message_id"], state, settings, tg, token, cfg)
+                changed |= bool(handle_button(cq.get("data", ""), msg["message_id"],
+                                              state, settings, tg, token, cfg))
             elif "text" in msg:
-                changed |= handle(msg["text"], state, settings, tg, token, cfg)
+                changed |= bool(handle(msg["text"], state, settings, tg, token, cfg))
         except Exception as e:  # noqa: BLE001
-            print(f"handle error: {e}", file=sys.stderr)
-            tg.send("Что-то пошло не так, попробуй ещё раз.")
+            print(f"handle error: {e!r}", file=sys.stderr)
+            tg.send("Что-то пошло не так, попробуй ещё раз.", back_button(settings, None))
     return changed
 
 
