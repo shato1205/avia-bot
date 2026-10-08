@@ -1,7 +1,7 @@
 {
   "origin": "MOW",
   "origin_name": "Москва",
-  "check_every_minutes": 120,
+  "check_every_minutes": 30,
   "months_ahead": 3,
   "drop_percent": 30,
   "history_days": 30,

@@ -246,7 +246,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
 
         cheapest = min(o["price"] for o in offers)
         route_history.append({"ts": now.isoformat(), "price": cheapest})
-        cutoff = (now - timedelta(days=90)).isoformat()
+        cutoff = (now - timedelta(days=cfg["history_days"])).isoformat()
         history[key] = [p for p in route_history if p["ts"] >= cutoff]
         print(f"{key}: минимум {cheapest} ₽")
 
