@@ -200,6 +200,8 @@ AIRLINES = {
     "VN": "Vietnam Airlines", "VJ": "VietJet", "FD": "Thai AirAsia", "AK": "AirAsia",
     "J9": "Jazeera Airways", "XY": "flynas", "OV": "SalamAir", "6E": "IndiGo", "UL": "SriLankan",
     "AI": "Air India", "MS": "EgyptAir", "B2": "Belavia", "XQ": "SunExpress", "IR": "Iran Air",
+    "JD": "Capital Airlines", "3U": "Sichuan Airlines", "ZH": "Shenzhen Airlines",
+    "SC": "Shandong Airlines", "MF": "Xiamen Airlines", "GS": "Tianjin Airlines",
 }
 # Лоукостеры: в самый дешёвый тариф багаж обычно не входит.
 LOWCOST = {"DP", "G9", "3L", "PC", "VF", "FZ", "XY", "J9", "OV", "VJ", "FD", "AK", "D7", "TR",
@@ -222,8 +224,11 @@ AIRPORT_CITIES = {
     "BKK": "Бангкок", "DMK": "Бангкок", "HKT": "Пхукет", "SGN": "Хошимин", "HAN": "Ханой",
     "DAD": "Дананг", "CXR": "Нячанг", "KUL": "Куала-Лумпур", "SIN": "Сингапур",
     "DPS": "Бали", "CGK": "Джакарта", "MNL": "Манила", "ICN": "Сеул", "NRT": "Токио",
+    "HGH": "Ханчжоу", "TAO": "Циндао", "XMN": "Сямэнь", "TSN": "Тяньцзинь", "CKG": "Чунцин",
+    "SYX": "Санья", "ZIA": "Москва", "KUT": "Кутаиси", "GOI": "Гоа", "GOX": "Гоа",
 }
 AUTO_EXTRA_MIN = 600  # «авто»: не дольше самого быстрого варианта + 10 часов на каждую сторону
+AUTO_MAX_MIN = 30 * 60  # и не дольше 30 часов на сторону, если есть варианты быстрее
 HOURS_STEPS = [None, 12, 16, 20, 24, 30, 0]  # None — авто, 0 — любое время в пути
 
 
@@ -237,7 +242,11 @@ def comfort(offers, max_hours, legs=1):
     timed = [travel_minutes(o) for o in offers if travel_minutes(o)]
     if max_hours == 0 or not timed:
         return offers
-    limit = max_hours * 60 * legs if max_hours else min(timed) + AUTO_EXTRA_MIN * legs
+    if max_hours:
+        limit = max_hours * 60 * legs
+    else:
+        fastest = min(timed)
+        limit = max(fastest, min(fastest + AUTO_EXTRA_MIN * legs, AUTO_MAX_MIN * legs))
     return [o for o in offers if not travel_minutes(o) or travel_minutes(o) <= limit]
 
 
@@ -247,7 +256,8 @@ def hours_label(max_hours):
 
 def hours_text(max_hours):
     if max_hours is None:
-        return "авто — отсеиваю билеты, где лететь на 10+ часов дольше самого быстрого"
+        return ("авто — отсеиваю билеты, где лететь на 10+ часов дольше самого быстрого "
+                "или больше 30 ч")
     if max_hours == 0:
         return "любое — показываю все пересадки"
     return f"не дольше {max_hours} ч в одну сторону"
@@ -259,12 +269,21 @@ def fmt_minutes(m):
 
 
 def transfer_cities(o):
-    """Города пересадок «туда»: аэропорты зашиты в ссылку Aviasales (…SVOCANHKT_…)."""
+    """(города пересадок, меняется ли аэропорт) для билета в одну сторону.
+
+    Аэропорты зашиты в ссылку Aviasales: …SVOCANHKT_… Если прилетаешь в один аэропорт,
+    а улетаешь из другого (…VKODWCDXBCMB_…), аэропортов больше, чем пересадок.
+    """
     m = re.search(r"[?&]t=[A-Z0-9]{2}\d+([A-Z]{6,})_", o.get("link", ""))
     if not m:
-        return []
-    codes = [m.group(1)[i:i + 3] for i in range(0, len(m.group(1)) - 2, 3)]
-    return [AIRPORT_CITIES.get(c, c) for c in codes[1:1 + o.get("transfers", 0)]]
+        return [], False
+    middle = [m.group(1)[i:i + 3] for i in range(3, len(m.group(1)) - 3, 3)]
+    cities = []
+    for c in middle:
+        city = AIRPORT_CITIES.get(c, c)
+        if not cities or cities[-1] != city:
+            cities.append(city)
+    return cities, len(middle) > o.get("transfers", 0)
 
 
 def trip_details(o):
@@ -281,8 +300,10 @@ def trip_details(o):
         if transfers == 0:
             parts.append("прямой")
         else:
-            where = ", ".join(transfer_cities(o))
-            parts.append(f"пересадок: {transfers}" + (f" ({where})" if where else ""))
+            cities, change = transfer_cities(o)
+            where = ", ".join(cities)
+            parts.append(f"пересадок: {transfers}" + (f" ({where})" if where else "")
+                         + (", ⚠️ смена аэропорта" if change else ""))
         if travel_minutes(o):
             parts.append(f"в пути {fmt_minutes(travel_minutes(o))}")
     line = " · ".join(parts)
