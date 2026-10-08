@@ -1,38 +1,48 @@
-"""Разовая загрузка справочников станций Travelpayouts/Tutu (удалить после проверки)."""
+"""Разовая проверка цен Туту.ру на дату (удалить после проверки)."""
 import json
 import os
+import time
 import urllib.request
+import uuid
+from datetime import date, timedelta
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-os.makedirs("probe/data", exist_ok=True)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+os.makedirs("probe/out", exist_ok=True)
+d = date.today() + timedelta(days=14)
 
 
-def get(url):
-    r = urllib.request.Request(url, headers={"User-Agent": UA})
+def req(name, url, body=None, headers=None, timeout=60):
+    h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+         "Accept-Language": "ru-RU,ru;q=0.9"}
+    h.update(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    r = urllib.request.Request(url, data=data, headers=h, method="POST" if body is not None else "GET")
+    t = time.time()
     try:
-        with urllib.request.urlopen(r, timeout=40) as resp:
-            return resp.status, resp.headers.get("Content-Type"), resp.read()
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            b = resp.read()
+            st = resp.status
+    except urllib.error.HTTPError as e:
+        b, st = e.read(), e.code
     except Exception as e:  # noqa: BLE001
-        return "ERR", None, repr(e).encode()
+        b, st = repr(e).encode(), "ERR"
+    print(f"{name}: {st} {len(b)}b {time.time() - t:.1f}s {b[:200]!r}", flush=True)
+    open(f"probe/out/{name}", "wb").write(b)
 
 
-FILES = {
-    "tutu_routes.csv.zip": "https://support.travelpayouts.com/hc/ru/article_attachments/360031345731",
-    "stations_ids.xlsx": "https://drive.google.com/uc?export=download&id=17YapFD0StwdwpdwPPJeDn9SDvAhmNkIf",
-    "stations_routes.xlsx": "https://drive.google.com/uc?export=download&id=13_zsY1ZUejnwjg_QfdGlbr9LWujB_bWW",
-}
-for name, url in FILES.items():
-    st, ct, body = get(url)
-    print(name, st, ct, len(body), body[:120] if st != 200 else "", flush=True)
-    if st == 200:
-        open(f"probe/data/{name}", "wb").write(body)
-
-for a, b in [("2000000", "2004000"), ("2004000", "2000000"), ("2000000", "2064130")]:
-    st, ct, body = get(f"https://suggest.travelpayouts.com/search?service=tutu_trains&term={a}&term2={b}")
-    print("\ntutu_trains", a, b, st)
-    try:
-        d = json.loads(body)
-        print("keys", list(d), "url", d.get("url"), "trips", len(d.get("trips", [])))
-        open(f"probe/data/trains_{a}_{b}.json", "wb").write(body)
-    except Exception as e:  # noqa: BLE001
-        print("bad", e, body[:300])
+TUTU = {"Origin": "https://www.tutu.ru", "Referer": "https://www.tutu.ru/"}
+for fmt in (d.isoformat(), d.strftime("%d.%m.%Y")):
+    body = {"routes": [{"departureStationCode": "2000000", "arrivalStationCode": "2004000",
+                        "departureDate": fmt}],
+            "searchId": str(uuid.uuid4()), "source": "trainOffers"}
+    req(f"offers_{fmt}.json", "https://offers-api.tutu.ru/railway/offers", body, TUTU)
+req("rasp_d.html", f"https://www.tutu.ru/poezda/rasp_d.php?nnst1=2000000&nnst2=2004000&date={d.strftime('%d.%m.%Y')}",
+    headers={"Accept": "text/html"})
+req("rasp_d_sochi.html", f"https://www.tutu.ru/poezda/rasp_d.php?nnst1=2000000&nnst2=2064130&date={d.strftime('%d.%m.%Y')}",
+    headers={"Accept": "text/html"})
+req("ufs.html", f"https://www.ufs-online.ru/kupit-zhd-bilety/2000000/2004000?date={d.strftime('%d.%m.%Y')}",
+    headers={"Accept": "text/html"})

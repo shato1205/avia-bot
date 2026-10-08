@@ -2,11 +2,18 @@ name: Проверка источников цен на поезда (време
 on:
   push:
     branches: [probe-trains]
-    paths: [probe/probe.sh, .github/workflows/probe.yml]
+    paths: [probe/probe.py, .github/workflows/probe.yml]
+permissions:
+  contents: write
 jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
-      - run: bash probe/probe.sh
+      - run: python3 -u probe/probe.py
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add probe/out
+          git commit -m "Результаты проверки" && git push || true
