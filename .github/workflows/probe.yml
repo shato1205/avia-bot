@@ -1,0 +1,10 @@
+name: Проверка источников цен на поезда (временно)
+on:
+  push:
+    branches: [probe-trains]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -u probe/probe.py
