@@ -28,6 +28,8 @@ SETTINGS = ROOT / "data" / "settings.json"
 STATE = ROOT / "data" / "state.json"
 HISTORY = ROOT / "data" / "history.json"
 SENT = ROOT / "data" / "sent.json"
+ACCESS = ROOT / "data" / "access.json"  # кто ещё может пользоваться ботом
+USERS_DIR = ROOT / "data" / "users"  # настройки остальных людей: data/users/<chat id>/
 STATIONS_FILE = ROOT / "stations.json"
 
 MSK = timezone(timedelta(hours=3))
@@ -107,6 +109,11 @@ class Telegram:
     def send(self, text, buttons=None):
         self.call("sendMessage", chat_id=self.chat_id, text=text,
                   reply_markup=self._markup(buttons), disable_web_page_preview="true")
+
+    def send_plain(self, text):
+        """Сообщение без кнопок и без нижнего меню (для тех, кому бот ещё не открыт)."""
+        self.call("sendMessage", chat_id=self.chat_id, text=text,
+                  reply_markup={"remove_keyboard": True})
 
     def edit(self, message_id, text, buttons):
         try:
@@ -544,9 +551,14 @@ def return_text(offer, rt, back, item=None):
     return "\n".join(lines)
 
 
-def format_alert(route, offer, reason, origin_name, extra=""):
+def shout(settings):
+    """«ГОША СРОЧНО» — у каждого человека своё имя в уведомлениях."""
+    return f"{settings.get('shout', 'ГОША')} СРОЧНО"
+
+
+def format_alert(route, offer, reason, origin_name, extra="", who="ГОША СРОЧНО"):
     return (
-        f"🔥 ГОША СРОЧНО {route['name']} {fmt_price(offer['price'])} ₽\n"
+        f"🔥 {who} {route['name']} {fmt_price(offer['price'])} ₽\n"
         f"{offer_line(offer, origin_name, route)}\n"
         + (f"{extra}\n" if extra else "")
         + f"Почему: {reason}"
@@ -588,7 +600,8 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
             rt, back = return_info(token, origin, route["destination"], o, route)
-            tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route)),
+            tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route),
+                                 shout(settings)),
                     alert_buttons(route, offer_link(o), rt))
             sent[sent_key] = now.isoformat()
             alerts += 1
@@ -619,7 +632,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         if not f.get("round_trip"):
             rt, back = return_info(token, origin, f["destination"], o, f)
             extra = return_text(o, rt, back, f)
-        tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
+        tg.send(f"🎯 {shout(settings)} {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
                 f"{offer_line(o, f['origin_name'], f)}\n" + (f"{extra}\n" if extra else "")
                 + f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o), rt))
         sent[sent_key] = now.isoformat()
@@ -658,10 +671,10 @@ def check_trains(tg, cfg, settings, history, sent, now):
             if sent_key in sent:
                 continue
             if "there" in o:
-                text = (f"🚆 ГОША СРОЧНО ПОЕЗД {t['from_name']} ⇄ {t['to_name']} "
+                text = (f"🚆 {shout(settings)} ПОЕЗД {t['from_name']} ⇄ {t['to_name']} "
                         f"{fmt_price(o['price'])} ₽ туда-обратно\n\n{train_pair_text(o)}\n\nПочему: {reason}")
             else:
-                text = (f"🚆 ГОША СРОЧНО ПОЕЗД {t['from_name']} → {t['to_name']} "
+                text = (f"🚆 {shout(settings)} ПОЕЗД {t['from_name']} → {t['to_name']} "
                         f"{fmt_price(o['price'])} ₽\n{train_offer_line(o)}\nПочему: {reason}")
             tg.send(text, train_buy_buttons(o) + alert_buttons(t))
             sent[sent_key] = now.isoformat()
@@ -1310,6 +1323,8 @@ def home_screen(settings):
     lines.append("\nНажми на город вылета или на «🚆 Поезда», чтобы настроить направления.")
     buttons.append([("➕ Город вылета", "no"), ("💰 Все цены", "pa")])
     buttons.append([(f"🚆 Поезда  ({len(trains)})", "t")])
+    if settings.get("owner"):
+        buttons.append([("👥 Друзья", "users")])
     return "\n".join(lines), buttons
 
 
@@ -2158,60 +2173,226 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     return False
 
 
-def process_messages(tg, token, cfg, settings, state, wait=0):
-    changed = False
-    for upd in tg.updates(state.get("offset", 0), wait):
-        state["offset"] = upd["update_id"] + 1
-        cq = upd.get("callback_query")
-        msg = (cq or {}).get("message") or upd.get("message") or {}
-        # Слушаемся только владельца бота.
-        if str(msg.get("chat", {}).get("id")) != tg.chat_id:
-            continue
-        try:
-            if cq:
-                tg.answer(cq["id"])
-                changed |= bool(handle_button(cq.get("data", ""), msg["message_id"],
-                                              state, settings, tg, token, cfg))
-            elif "text" in msg:
-                changed |= bool(handle(msg["text"], state, settings, tg, token, cfg))
-        except Exception as e:  # noqa: BLE001
-            print(f"handle error: {e!r}", file=sys.stderr)
-            tg.send("Что-то пошло не так, попробуй ещё раз.", back_button(settings, None))
-    return changed
+# ---------- Люди: владелец и друзья по приглашению ----------
+
+ACCESS_CMDS = {"users", "ua", "ud", "uq", "ux"}
+
+
+def person_label(info):
+    info = info or {}
+    name = info.get("name") or "Без имени"
+    return name + (f" (@{info['username']})" if info.get("username") else "")
+
+
+class User:
+    """Настройки, состояние и история одного человека.
+
+    Владелец хранится в data/ (как раньше), остальные — в data/users/<chat id>/.
+    """
+
+    def __init__(self, chat_id, folder, tg, default_settings):
+        self.chat_id = str(chat_id)
+        self.dir = folder
+        self.tg = tg
+        self.settings = load(folder / "settings.json", None) or default_settings
+        ensure_origins(self.settings)
+        self.state = load(folder / "state.json", {})
+        self.history = load(folder / "history.json", {})
+        self.sent = load(folder / "sent.json", {})
+
+    def save(self):
+        for name in ("settings", "state", "history", "sent"):
+            save(self.dir / f"{name}.json", getattr(self, name))
+
+
+def users_screen(access, users, bot_link=""):
+    lines = ["👥 Друзья\n"]
+    buttons = []
+    allowed = access["allowed"]
+    if allowed:
+        lines.append("Пользуются ботом (нажми, чтобы убрать):")
+        for uid, info in allowed.items():
+            settings = users[uid].settings if uid in users else {}
+            n = len(settings.get("routes", [])) + len(settings.get("filters", [])) \
+                + len(settings.get("trains", []))
+            buttons.append([(f"👤 {person_label(info)} · направлений {n}", f"uq:{uid}")])
+    else:
+        lines.append("Пока ботом пользуешься только ты.")
+    for uid, info in access["pending"].items():
+        lines.append(f"\n⏳ Просится: {person_label(info)}")
+        buttons.append([(f"✅ Пустить {info.get('name') or ''}".strip(), f"ua:{uid}"),
+                        ("🚫 Нет", f"ud:{uid}")])
+    for uid, info in access["denied"].items():
+        buttons.append([(f"↩️ Всё-таки пустить {person_label(info)}", f"ua:{uid}")])
+    lines.append("\nКак пригласить: отправь другу ссылку на бота"
+                 + (f" {bot_link}" if bot_link else "")
+                 + ". Друг напишет боту, а тебе придёт запрос «Пустить?». "
+                 "У каждого свои направления и уведомления, твои они не видят.")
+    return "\n".join(lines), buttons + [[("⬅️ В меню", "home")]]
 
 
 class Bot:
     def __init__(self):
         self.token = os.environ["TRAVELPAYOUTS_TOKEN"]
-        self.tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
+        self.bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+        owner_id = str(os.environ["TELEGRAM_CHAT_ID"])
+        self.tg = Telegram(self.bot_token, owner_id)
         self.cfg = load(CONFIG, {})
         cfg = self.cfg
-        self.settings = load(SETTINGS, None) or {
+        self.owner = User(owner_id, ROOT / "data", self.tg, {
             "origin": cfg["origin"],
             "origin_name": cfg.get("origin_name", cfg["origin"]),
             "routes": [dict(r, city=r.get("city", r["destination"])) for r in cfg["routes"]],
-        }
-        ensure_origins(self.settings)
-        self.state = load(STATE, {})
-        self.history = load(HISTORY, {})
-        self.sent = load(SENT, {})
+        })
+        self.owner.settings["owner"] = True
+        self.access = load(ACCESS, {})
+        for key in ("allowed", "pending", "denied"):
+            self.access.setdefault(key, {})
+        self.users = {owner_id: self.owner}
+        for uid in self.access["allowed"]:
+            self.users[uid] = self.load_user(uid)
+        self.bot_link = ""
+
+    # Старые имена: настройки и состояние владельца.
+    settings = property(lambda self: self.owner.settings)
+    state = property(lambda self: self.owner.state)
+    history = property(lambda self: self.owner.history)
+    sent = property(lambda self: self.owner.sent)
+
+    def load_user(self, uid):
+        info = self.access["allowed"].get(uid) or {}
+        first = (info.get("name") or "").split(" ")[0]
+        return User(uid, USERS_DIR / uid, Telegram(self.bot_token, uid), {
+            "origin": self.cfg["origin"],
+            "origin_name": self.cfg.get("origin_name", self.cfg["origin"]),
+            "routes": [], "filters": [], "trains": [],
+            "shout": first.upper() if first else "ЭЙ",
+        })
+
+    def stranger(self, uid, chat):
+        """Пишет человек, которому бот ещё не открыт: спрашиваем владельца."""
+        if uid in self.access["denied"]:
+            return
+        tg = Telegram(self.bot_token, uid)
+        if uid in self.access["pending"]:
+            tg.send_plain("Запрос уже у владельца бота. Как только доступ откроют, я напишу.")
+            return
+        name = " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+        info = {"name": name, "username": chat.get("username"),
+                "ts": datetime.now(timezone.utc).isoformat()}
+        self.access["pending"][uid] = info
+        tg.send_plain("Привет! Это личный бот для поиска дешёвых билетов. "
+                      "Я отправил запрос владельцу бота. Как только доступ откроют, я напишу.")
+        self.tg.send(f"👤 {person_label(info)} хочет пользоваться ботом. Пустить?",
+                     [[("✅ Пустить", f"ua:{uid}"), ("🚫 Нет", f"ud:{uid}")]])
+
+    def get_bot_link(self):
+        if not self.bot_link:
+            try:
+                name = self.tg.call("getMe").get("result", {}).get("username")
+                self.bot_link = f"https://t.me/{name}" if name else ""
+            except Exception as e:  # noqa: BLE001
+                print(f"getMe error: {e!r}", file=sys.stderr)
+        return self.bot_link
+
+    def access_button(self, data, message_id):
+        cmd, _, uid = data.partition(":")
+        edit = lambda t, b: self.tg.edit(message_id, t, b)  # noqa: E731
+        people = [[("👥 Друзья", "users")]]
+        acc = self.access
+        if cmd == "users":
+            edit(*users_screen(acc, self.users, self.get_bot_link()))
+        elif cmd == "ua":
+            if uid in acc["allowed"]:
+                edit(f"{person_label(acc['allowed'][uid])} уже пользуется ботом.", people)
+                return
+            info = acc["pending"].pop(uid, None) or acc["denied"].pop(uid, None)
+            if info is None:
+                edit("Этого запроса уже нет.", people)
+                return
+            acc["allowed"][uid] = info
+            user = self.users[uid] = self.load_user(uid)
+            user.tg.send("✅ Доступ открыт! Вот как я работаю:\n\n" + HELP)
+            user.tg.send(*home_screen(user.settings))
+            edit(f"✅ Пустил: {person_label(info)}. Твои направления этот человек не видит.", people)
+        elif cmd == "ud":
+            info = acc["pending"].pop(uid, None)
+            if info is not None:
+                acc["denied"][uid] = info
+                Telegram(self.bot_token, uid).send_plain("Владелец бота не открыл доступ, извини.")
+            edit(f"🚫 Не пустил: {person_label(info)}", people)
+        elif cmd == "uq" and uid in acc["allowed"]:
+            edit(f"Убрать {person_label(acc['allowed'][uid])}? Бот перестанет отвечать этому человеку "
+                 "и присылать ему билеты.", [[("🗑 Да, убрать", f"ux:{uid}"), ("Отмена", "users")]])
+        elif cmd == "ux" and uid in acc["allowed"]:
+            info = acc["allowed"].pop(uid)
+            user = self.users.pop(uid, None)
+            if user:
+                user.save()  # настройки остаются на диске: если пустишь снова, всё вернётся
+            edit(f"🗑 Убрал: {person_label(info)}", people)
+        else:
+            edit(*users_screen(acc, self.users, self.get_bot_link()))
+
+    def process_messages(self, wait=0):
+        """Читает новые сообщения. Возвращает chat id людей, у которых поменялись направления."""
+        changed = set()
+        state = self.owner.state
+        for upd in self.tg.updates(state.get("offset", 0), wait):
+            state["offset"] = upd["update_id"] + 1
+            cq = upd.get("callback_query")
+            msg = (cq or {}).get("message") or upd.get("message") or {}
+            chat = msg.get("chat", {})
+            if chat.get("type", "private") != "private":
+                continue  # в группах бот не работает
+            uid = str(chat.get("id"))
+            user = self.users.get(uid)
+            try:
+                if user is None:
+                    if cq:
+                        self.tg.answer(cq["id"])
+                    else:
+                        self.stranger(uid, chat)
+                    continue
+                if cq:
+                    user.tg.answer(cq["id"])
+                    data = cq.get("data", "")
+                    if user is self.owner and data.partition(":")[0] in ACCESS_CMDS:
+                        self.access_button(data, msg["message_id"])
+                    elif handle_button(data, msg["message_id"], user.state, user.settings,
+                                       user.tg, self.token, self.cfg):
+                        changed.add(uid)
+                elif "text" in msg:
+                    if handle(msg["text"], user.state, user.settings, user.tg, self.token, self.cfg):
+                        changed.add(uid)
+            except Exception as e:  # noqa: BLE001
+                print(f"handle error {uid}: {e!r}", file=sys.stderr)
+                if user is not None:
+                    user.tg.send("Что-то пошло не так, попробуй ещё раз.",
+                                 back_button(user.settings, None))
+        return changed
 
     def step(self, wait=0):
         """Один проход: сообщения, затем (если пора) проверка цен, затем сохранение."""
-        changed = process_messages(self.tg, self.token, self.cfg, self.settings, self.state, wait)
+        changed = self.process_messages(wait)
         now = datetime.now(timezone.utc)
-        last = self.state.get("last_check")
+        state = self.owner.state
+        last = state.get("last_check")
         due = not last or now - datetime.fromisoformat(last) >= timedelta(
             minutes=self.cfg["check_every_minutes"] - 5)
-        if due or changed:
-            check_prices(self.tg, self.token, self.cfg, self.settings, self.history, self.sent, now)
-            self.state["last_check"] = now.isoformat()
+        for uid, user in list(self.users.items()):
+            if not (due or uid in changed):
+                continue
+            try:
+                check_prices(user.tg, self.token, self.cfg, user.settings, user.history, user.sent, now)
+            except Exception as e:  # noqa: BLE001
+                print(f"check error {uid}: {e!r}", file=sys.stderr)
             week_ago = now - timedelta(days=7)
-            self.sent = {k: v for k, v in self.sent.items() if datetime.fromisoformat(v) >= week_ago}
-        save(SETTINGS, self.settings)
-        save(STATE, self.state)
-        save(HISTORY, self.history)
-        save(SENT, self.sent)
+            user.sent = {k: v for k, v in user.sent.items() if datetime.fromisoformat(v) >= week_ago}
+        if due or self.owner.chat_id in changed:
+            state["last_check"] = now.isoformat()
+        for user in self.users.values():
+            user.save()
+        save(ACCESS, self.access)
 
 
 def main():
