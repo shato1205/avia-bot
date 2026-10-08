@@ -183,7 +183,8 @@ def months(n):
     return out
 
 
-def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=True, direct=False):
+def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=True, direct=False,
+                   limit=30):
     """month — YYYY-MM или YYYY-MM-DD. При one_way=False цена за туда-обратно."""
     params = {
         "origin": origin,
@@ -193,7 +194,7 @@ def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=Tr
         "sorting": "price",
         "one_way": "true" if one_way else "false",
         "direct": "true" if direct else "false",
-        "limit": 30,  # с запасом: часть билетов отсеется из-за долгих пересадок
+        "limit": limit,  # с запасом: часть билетов отсеется (долгие пересадки, время вылета)
         "token": token,
     }
     if return_at:
@@ -209,8 +210,13 @@ def route_offers(token, origin, route, cfg, comfort_filter=True):
     offers = []
     for month in months(cfg["months_ahead"]):
         offers += fetch_cheapest(token, origin, route["destination"], month,
-                                 direct=route.get("direct", False))
-    return comfort(offers, route.get("max_hours")) if comfort_filter else offers
+                                 direct=route.get("direct", False), limit=api_limit(route))
+    return flight_filter(offers, route) if comfort_filter else offers
+
+
+def api_limit(item):
+    """Сколько билетов просить у API: с фильтрами по времени и багажу — побольше."""
+    return 100 if item.get("times") or item.get("back_times") or item.get("bag") else 30
 
 
 # ---------- Удобство: пересадки, время в пути, багаж ----------
@@ -275,6 +281,53 @@ def comfort(offers, max_hours, legs=1):
         fastest = min(timed)
         limit = max(fastest, min(fastest + AUTO_EXTRA_MIN * legs, AUTO_MAX_MIN * legs))
     return [o for o in offers if not travel_minutes(o) or travel_minutes(o) <= limit]
+
+
+def has_bag(o):
+    """Багаж по тарифу: True — включён, False — нет, None — неизвестно."""
+    m = re.search(r"static_fare_key=([^&]+)", o.get("link", ""))
+    if m:
+        parts = urllib.parse.unquote(m.group(1)).split("|")
+        if "L0" in parts:
+            return False
+        if any(part.startswith("L1") for part in parts):
+            return True
+    return None
+
+
+def bag_ok(o):
+    """Есть ли багаж (если тариф неизвестен — у лоукостеров считаем, что нет)."""
+    bag = has_bag(o)
+    return bag if bag is not None else o.get("airline", "") not in LOWCOST
+
+
+def time_ok(times, iso):
+    """Подходит ли время вылета (…T23:15…) под выбранные части суток."""
+    part = part_of(iso[11:16])
+    return not times or not part or part in times
+
+
+def flight_filter(offers, item, legs=1, back=False):
+    """Билеты под настройки направления: время в пути, время вылета, багаж.
+
+    back=True — это обратные рейсы: время вылета сверяем с «обратно».
+    """
+    times = item.get("back_times" if back else "times")
+    return [o for o in comfort(offers, item.get("max_hours"), legs)
+            if time_ok(times, o.get("departure_at", ""))
+            and (back or not o.get("return_at") or time_ok(item.get("back_times"), o["return_at"]))
+            and (not item.get("bag") or bag_ok(o))]
+
+
+def skip_reason(o, item):
+    """Почему билет не показываем: «вылет в 03:10», «без багажа», «в пути 31 ч»."""
+    if not time_ok(item.get("times"), o.get("departure_at", "")):
+        return f"вылет в {o['departure_at'][11:16]}"
+    if o.get("return_at") and not time_ok(item.get("back_times"), o["return_at"]):
+        return f"обратно вылет в {o['return_at'][11:16]}"
+    if item.get("bag") and not bag_ok(o):
+        return "без багажа"
+    return f"в пути {fmt_minutes(travel_minutes(o))}"
 
 
 def hours_label(max_hours):
@@ -363,20 +416,19 @@ def item_offers(token, kind, item, cfg):
     """(все билеты, билеты без долгих пересадок) для направления или подбора."""
     if kind == "route":
         all_offers = route_offers(token, item["origin"], item, cfg, comfort_filter=False)
-        return all_offers, comfort(all_offers, item.get("max_hours"))
+        return all_offers, flight_filter(all_offers, item)
     all_offers = filter_offers(token, item["origin"], item, comfort_filter=False)
-    return all_offers, comfort(all_offers, item.get("max_hours"), 2 if item.get("round_trip") else 1)
+    return all_offers, flight_filter(all_offers, item, 2 if item.get("round_trip") else 1)
 
 
-def skipped_note(all_offers, offers):
-    """Про отсеянные билеты: «дешевле есть, но 31 ч в пути»."""
+def skipped_note(all_offers, offers, item=None):
+    """Про отсеянные билеты: «дешевле есть, но 31 ч в пути» (или вылет ночью, или без багажа)."""
     best = min(o["price"] for o in offers) if offers else None
     cheaper = [o for o in all_offers if o not in offers and (best is None or o["price"] < best)]
     if not cheaper:
         return ""
     o = min(cheaper, key=lambda x: x["price"])
-    return (f"💤 Дешевле есть: {fmt_price(o['price'])} ₽, но в пути {fmt_minutes(travel_minutes(o))} "
-            "— такие не показываю")
+    return f"💤 Дешевле есть: {fmt_price(o['price'])} ₽, но {skip_reason(o, item or {})} — такие не показываю"
 
 
 def find_deals(route, offers, history, cfg, now):
@@ -400,11 +452,13 @@ def find_deals(route, offers, history, cfg, now):
 
 
 def filter_offers(token, origin, f, comfort_filter=True):
-    offers = fetch_cheapest(token, origin, f["destination"], f["depart"], f.get("return"),
-                            one_way=not f.get("round_trip"), direct=f.get("direct", False))
+    offers = fetch_cheapest(token, origin, f["destination"], f["depart"],
+                            f.get("return") if f.get("round_trip") else None,
+                            one_way=not f.get("round_trip"), direct=f.get("direct", False),
+                            limit=api_limit(f))
     if not comfort_filter:
         return offers
-    return comfort(offers, f.get("max_hours"), 2 if f.get("round_trip") else 1)
+    return flight_filter(offers, f, 2 if f.get("round_trip") else 1)
 
 
 def offer_link(offer):
@@ -485,10 +539,11 @@ def return_info(token, origin, destination, offer, item):
         inside = lambda d: lo.isoformat() <= d[:10] <= hi.isoformat()  # noqa: E731
         rt, back = [], []
         for q in window_queries(lo, hi):
-            rt += fetch_cheapest(token, origin, destination, dep.isoformat(), q, one_way=False)
-            back += fetch_cheapest(token, destination, origin, q)
-        rt = comfort([o for o in rt if inside(o.get("return_at", ""))], item.get("max_hours"), 2)
-        back = comfort([o for o in back if inside(o["departure_at"])], item.get("max_hours"))
+            rt += fetch_cheapest(token, origin, destination, dep.isoformat(), q, one_way=False,
+                                 limit=api_limit(item))
+            back += fetch_cheapest(token, destination, origin, q, limit=api_limit(item))
+        rt = flight_filter([o for o in rt if inside(o.get("return_at", ""))], item, 2)
+        back = flight_filter([o for o in back if inside(o["departure_at"])], item, back=True)
     except Exception as e:  # noqa: BLE001
         print(f"return_info {origin}-{destination}: {e!r}", file=sys.stderr)
         return None, None
@@ -530,9 +585,10 @@ def parse_back(text, today):
 def pick_back_screen(item):
     i = item["id"]
     text = (f"↩️ {item['city']}: когда летим обратно?\n\nСейчас: {back_text(item)}.\n\n"
-            "Выбери срок кнопкой или нажми «✏️ Вписать свою дату».")
+            "Выбери срок кнопкой, точный день в календаре или впиши свою дату.")
     btns = [(label, f"iy:{i}:{lo}-{hi}") for label, lo, hi in BACK_PRESETS]
-    return text, rows(btns, 3) + [[("✏️ Вписать свою дату", f"ie:{i}")], [("⬅️ Отмена", f"i:{i}")]]
+    return text, rows(btns, 3) + [[("📅 День в календаре", f"ij:{i}"), ("✏️ Вписать свою дату", f"ie:{i}")],
+                                  [("⬅️ Отмена", f"i:{i}")]]
 
 
 BACK_HINT = ("Напиши, когда тебе нужно обратно:\n"
@@ -603,7 +659,9 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         if route.get("paused"):
             continue
         origin = route["origin"]
-        key = f"{origin}-{route['destination']}"
+        key = f"{origin}-{route['destination']}" + "".join(
+            f"|{f}:{''.join(route[f]) if isinstance(route[f], list) else 1}"
+            for f in ("times", "back_times", "bag") if route.get(f))
         offers = route_offers(token, origin, route, cfg)
         if not offers:
             continue
@@ -748,10 +806,15 @@ def prices_now(token, cfg, settings, origin=None):
         for kind, item in pairs:
             title = item["name"] if kind == "route" else "🎯 " + filter_text(item)
             all_offers, offers = item_offers(token, kind, item, cfg)
-            note = skipped_note(all_offers, offers)
+            note = skipped_note(all_offers, offers, item)
             if not offers:
                 lines.append(f"{title}: билетов не нашёл" + (f"\n{note}" if note else ""))
                 continue
+            parts = flight_parts(offers)
+            if len(parts) > 1:
+                note = ("🕐 По времени вылета: "
+                        + ", ".join(f"{DAY_PART_NAMES[c].split(' ', 1)[1].lower()} от {k(o['price'])}"
+                                    for c, o in parts) + (f"\n{note}" if note else ""))
             best = min(offers, key=lambda o: o["price"])
             back_line = ""
             if not item.get("round_trip"):
@@ -819,12 +882,32 @@ TUTU_CARS = {"RESERVED_SEAT": "plazcard", "COMPARTMENT": "coupe", "SEDENTARY": "
              "LUX": "lux", "SOFT": "soft"}
 
 
-def day_part(o):
-    """Часть суток, когда отправляется поезд: m, d, e, n (или "", если время неизвестно)."""
-    t = o.get("dep_time") or ""
-    if not t[:2].isdigit():
+def part_of(hhmm):
+    """«07:30» → часть суток m, d, e, n (или "", если время неизвестно)."""
+    if not (hhmm or "")[:2].isdigit():
         return ""
-    return next(code for code, _, lo, hi in DAY_PARTS if lo <= int(t[:2]) < hi)
+    return next(code for code, _, lo, hi in DAY_PARTS if lo <= int(hhmm[:2]) < hi)
+
+
+def day_part(o):
+    """Часть суток, когда отправляется поезд."""
+    return part_of(o.get("dep_time"))
+
+
+def flight_parts(offers):
+    """Самый дешёвый рейс в каждой части суток (по времени вылета): [(код, билет)]."""
+    best = {}
+    for o in offers:
+        part = part_of(o.get("departure_at", "")[11:16])
+        if part and (part not in best or o["price"] < best[part]["price"]):
+            best[part] = o
+    return [(code, best[code]) for code, *_ in DAY_PARTS if code in best]
+
+
+def flight_short(o):
+    """«31 000 ₽ · 15.10 в 01:30 · Аэрофлот, прямой, 9 ч 30 мин»."""
+    back = f", обратно {short_date(o['return_at'])}" if o.get("return_at") else ""
+    return f"{fmt_price(o['price'])} ₽ · {short_date(o['departure_at'])}{back} · {brief(o)}"
 
 
 def day_part_label(code):
@@ -1521,12 +1604,18 @@ def train_screen(item, note=""):
     return "\n".join(lines), buttons
 
 
-def train_times_screen(item):
+def times_screen(kind, item):
     i = item["id"]
-    rt = bool(item.get("back_dates"))
-    lines = [f"🕐 {train_title(item)}\n",
-             "Во сколько тебе удобно отправляться? Отметь одно или несколько — "
-             "буду искать и присылать только такие поезда."]
+    if kind == "train":
+        rt = bool(item.get("back_dates"))
+        lines = [f"🕐 {train_title(item)}\n",
+                 "Во сколько тебе удобно отправляться? Отметь одно или несколько — "
+                 "буду искать и присылать только такие поезда."]
+    else:
+        rt = True  # у самолётов всегда есть «обратно»: обратный рейс или цена обратного билета
+        lines = [f"🕐 {item['origin_name']} → {item['city']}\n",
+                 "Во сколько тебе удобно вылетать? Отметь одно или несколько — буду искать "
+                 "и присылать только такие рейсы. «Обратно» — время вылета обратного рейса."]
     buttons = []
     for field, title in (("times", "➡️ Туда"), ("back_times", "⬅️ Обратно")):
         if field == "back_times" and not rt:
@@ -1541,6 +1630,12 @@ def train_times_screen(item):
     lines.append("\nСейчас: " + times_text(item.get("times"))
                  + (", обратно: " + times_text(item.get("back_times")) if rt else ""))
     return "\n".join(lines), buttons + [[("✅ Готово", f"if:{i}")]]
+
+
+def flight_times_label(item):
+    """«утро, вечер / любое» — коротко для кнопки."""
+    back = item.get("back_times")
+    return times_text(item.get("times")) + (" / обратно " + times_text(back) if back else "")
 
 
 def item_screen(settings, item_id, note=""):
@@ -1564,10 +1659,13 @@ def item_screen(settings, item_id, note=""):
         lines.append(f"Сообщу, когда билет дешевле {fmt_price(item['max_price'])} ₽.")
     if item.get("last_price"):
         lines.append(last_price_line(item))
-    lines.append("Только прямые рейсы ✈️" if item.get("direct") else "С пересадками тоже")
+    lines.append("🕐 Время вылета: " + times_text(item.get("times"))
+                 + ", обратно: " + times_text(item.get("back_times")))
+    lines.append("✈️ Только прямые рейсы" if item.get("direct") else "✈️ С пересадками тоже")
     lines.append("⏱ Время в пути: " + hours_text(item.get("max_hours")))
-    if not item.get("round_trip"):
-        lines.append("↩️ Обратно: " + back_text(item) + " (покажу цену туда-обратно)")
+    lines.append("🧳 Только билеты с багажом" if item.get("bag") else "🧳 Багаж: не важно")
+    if kind == "route":
+        lines.append("↩️ Обратно: " + back_text(item) + " (покажу, сколько стоит вернуться)")
     lines.append("⏸ На паузе: не присылаю уведомления" if item.get("paused") else "✅ Слежу")
 
     buttons = [
@@ -1576,16 +1674,27 @@ def item_screen(settings, item_id, note=""):
         [("✏️ Своя цена", f"it:{i}")],
     ]
     if kind == "filter":
-        trip_btn = "🔁 Сделать в одну сторону" if item.get("round_trip") else "🔁 Сделать туда-обратно"
-        row = [("📅 Изменить даты", f"id:{i}")]
-        if not item.get("return"):
-            row.append((trip_btn, f"ir:{i}"))
-        buttons.append(row)
+        dep = item["depart"]
+        if len(dep) == 10:
+            back = (f"{item['return'][8:]}.{item['return'][5:7]}" if item.get("return")
+                    else "любой день" if item.get("round_trip") else "нет")
+            buttons.append([(f"📅 Вылет: {dep[8:]}.{dep[5:7]}", f"id:{i}"),
+                            ("🔁 Обратно: " + back, f"ij:{i}")])
+        else:
+            back = (MONTH_NOM[int(item["return"][5:])] if item.get("return")
+                    else "да" if item.get("round_trip") else "нет")
+            buttons.append([("📅 Вылет: " + MONTH_NOM[int(dep[5:])], f"id:{i}"),
+                            ("🔁 Туда-обратно: " + back, f"ir:{i}")])
     buttons += [
+        [("🕐 Время вылета: " + flight_times_label(item), f"iw:{i}")],
         [("✈️ Только прямые: " + ("вкл" if item.get("direct") else "выкл"), f"ic:{i}"),
          ("⏱ В пути: " + hours_label(item.get("max_hours")), f"ih:{i}")],
-        ([] if item.get("round_trip") else [("↩️ Когда обратно", f"ib:{i}")])
-        + [("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
+        [("🧳 С багажом: " + ("вкл" if item.get("bag") else "выкл"), f"is:{i}"),
+         ("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
+    ]
+    if kind == "route":
+        buttons.append([("↩️ Когда обратно: " + back_text(item), f"ib:{i}")])
+    buttons += [
         [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
         [(f"⬅️ {item['origin_name']}", f"o:{item['origin']}")],
     ]
@@ -1603,18 +1712,84 @@ def pick_city_screen(settings, kind):
     return text, rows(btns, 3) + [[("⬅️ Отмена", f"o:{settings['origin']}")]]
 
 
-def pick_dates_screen(wiz):
-    today = date.today()
-    btns = []
-    d = today.replace(day=1)
+FLIGHT_DAYS_AHEAD = 330  # цены на авиабилеты бывают примерно на год вперёд
+FLIGHT_DATES_HINT = ("Напиши даты:\n"
+                     "• 15.12 — день вылета\n"
+                     "• 15.12-25.12 — вылет и обратно\n"
+                     "• декабрь — любой день месяца, найду самый дешёвый")
+FLIGHT_BACK_HINT = ("Напиши дату вылета обратно, например 25.12.\n"
+                    "Обратный билет не нужен — напиши «нет».")
+BACK_QUICK = [("Неделя", 7), ("10 дней", 10), ("2 недели", 14)]
+
+
+def pick_flight_dates_screen(title, prefix, cancel, nav, write, month=None):
+    """Когда вылет: календарь, весь месяц (гибкие даты), своя дата текстом."""
+    today = datetime.now(MSK).date()
+    hi = today + timedelta(days=FLIGHT_DAYS_AHEAD)
+    months_btns, d = [], today.replace(day=1)
     for _ in range(6):
-        btns.append((MONTH_NOM[d.month].capitalize(), f"wm:{d.strftime('%Y-%m')}"))
+        months_btns.append((MONTH_NOM[d.month].capitalize(), f"{prefix}{d:%Y-%m}"))
         d = (d + timedelta(days=32)).replace(day=1)
-    text = (f"🎯 {wiz['city']}: когда летим?\n\n"
-            "Выбери месяц или напиши точные даты:\n"
-            "• 15.12-25.12 — туда-обратно\n"
-            "• 20.11 — один день вылета")
-    return text, rows(btns, 3) + [[("⬅️ Отмена", f"o:{wiz['origin']}")]]
+    text = (f"{title}: когда вылет?\n\nНажми на день в календаре. Даты гибкие — выбери месяц "
+            "под календарём, найду самый дешёвый день в нём.")
+    return (text, calendar_rows(month or today, prefix, nav, today, hi)
+            + [[("— или весь месяц —", "noop")]] + rows(months_btns, 3)
+            + [[("✏️ Вписать свою дату", write)], cancel])
+
+
+def pick_flight_back_screen(title, depart, prefix, cancel, nav, write, month=None):
+    """Когда обратно. depart — день вылета «туда» (для подбора) или None (просто день обратно)."""
+    today = datetime.now(MSK).date()
+    hi = today + timedelta(days=FLIGHT_DAYS_AHEAD)
+    if depart:
+        lo = date.fromisoformat(depart)
+        quick = [(f"{label} · {lo + timedelta(days=n):%d.%m}", f"{prefix}{lo + timedelta(days=n)}")
+                 for label, n in BACK_QUICK if lo + timedelta(days=n) <= hi]
+        text = (f"{title}: вылет {lo:%d.%m}. Когда обратно?\n\nНажми на день — найду билет "
+                "туда-обратно и посчитаю общую цену. Обратный не нужен — жми «➡️ Только туда».")
+        top, last = [quick], [("✏️ Вписать свою дату", write), ("➡️ Только туда", f"{prefix}none")]
+    else:
+        lo = today + timedelta(days=1)
+        text = (f"{title}: в какой день летим обратно?\n\nНажми на день — под каждым билетом "
+                "покажу, сколько стоит вернуться именно в этот день.")
+        top, last = [], [("✏️ Вписать свою дату", write)]
+    return text, top + calendar_rows(month or lo, prefix, nav, lo, hi) + [last, cancel]
+
+
+def parse_flight_back(text, today, depart):
+    """Дата обратно для подбора: YYYY-MM-DD, "none" (только туда) или строка-ошибка."""
+    if _norm(text) in ("нет", "не нужно", "не надо", "только туда", "без обратного"):
+        return "none"
+    f = parse_dates(text, today)
+    if isinstance(f, str) or len(f["depart"]) != 10:
+        return "Напиши дату обратно, например 25.12, или «нет», если обратный билет не нужен."
+    if f["depart"] < depart:
+        return "Дата обратно получилась раньше вылета. Проверь дату."
+    return f["depart"]
+
+
+def set_filter_back(item, back):
+    """Обратно для подбора: день YYYY-MM-DD или "none" (только туда)."""
+    item.pop("return", None)
+    item["round_trip"] = back != "none"
+    if back != "none":
+        item["return"] = back
+    item.pop("last_price", None)
+
+
+def flight_dates_wizard_screen(wiz, month=None):
+    return pick_flight_dates_screen(f"🎯 {wiz['city']}", "wm:", wiz_cancel(wiz), "wk:", "we", month)
+
+
+def flight_back_wizard_screen(wiz, month=None):
+    return pick_flight_back_screen(f"🎯 {wiz['city']}", wiz["depart"], "wb:", wiz_cancel(wiz),
+                                   "wj:", "wf", month)
+
+
+def filter_back_screen(item, month=None):
+    i = item["id"]
+    return pick_flight_back_screen(f"🎯 {item['city']}", item["depart"], f"ig:{i}:",
+                                   [("⬅️ Отмена", f"i:{i}")], f"il:{i}:", f"io:{i}", month)
 
 
 def pick_trip_screen(wiz):
@@ -1798,8 +1973,11 @@ def wizard_next(state, settings, tg, token, cfg, message_id=None):
         return train_wizard_next(state, settings, tg, token, cfg, show)
     if wiz["kind"] == "f" and "depart" not in wiz:
         state["awaiting"] = {"type": "wiz_dates"}
-        return show(*pick_dates_screen(wiz))
+        return show(*flight_dates_wizard_screen(wiz))
     if wiz["kind"] == "f" and "round_trip" not in wiz:
+        if len(wiz["depart"]) == 10:
+            state["awaiting"] = {"type": "wiz_fback"}
+            return show(*flight_back_wizard_screen(wiz))
         return show(*pick_trip_screen(wiz))
     if "price" not in wiz:
         state["awaiting"] = {"type": "wiz_price"}
@@ -1967,6 +2145,31 @@ def handle(text, state, settings, tg, token, cfg):
         wiz["back_dates"] = None if back == "none" else back
         wizard_next(state, settings, tg, token, cfg)
         return False
+    if kind == "wiz_fback" and wiz and len(wiz.get("depart", "")) == 10:
+        back = parse_flight_back(text, date.today(), wiz["depart"])
+        if back != "none" and len(back) != 10:
+            state["awaiting"] = awaiting
+            tg.send(back)
+            return False
+        wiz["round_trip"] = back != "none"
+        wiz.pop("return", None)
+        if back != "none":
+            wiz["return"] = back
+        wizard_next(state, settings, tg, token, cfg)
+        return False
+    if kind == "item_fback":
+        item_kind, item = find_item(settings, awaiting.get("id"))
+        if not item or item_kind != "filter" or len(item["depart"]) != 10:
+            tg.send(*home_screen(settings))
+            return False
+        back = parse_flight_back(text, date.today(), item["depart"])
+        if back != "none" and len(back) != 10:
+            state["awaiting"] = awaiting
+            tg.send(back)
+            return False
+        set_filter_back(item, back)
+        tg.send(*item_screen(settings, item["id"], "✅ Сохранил.\n"))
+        return True
     if kind == "item_tback":
         item_kind, item = find_item(settings, awaiting.get("id"))
         if not item or not item.get("dates"):
@@ -2043,6 +2246,12 @@ def handle(text, state, settings, tg, token, cfg):
             item.pop("return", None)
             fields.setdefault("round_trip", item.get("round_trip", True))
             item.update(fields)
+            item.pop("last_price", None)
+            if len(item["depart"]) == 10 and not item.get("return"):
+                # Один день вылета — сразу спросим, когда обратно (цены проверю после ответа).
+                state["awaiting"] = {"type": "item_fback", "id": item["id"]}
+                tg.send(*filter_back_screen(item))
+                return False
         tg.send(*item_screen(settings, item["id"], "✅ Сохранил.\n" + awaiting.get("note", "")))
         return True
 
@@ -2134,12 +2343,37 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     elif cmd == "wd" and state.get("wiz", {}).get("kind") == "t":
         state["wiz"]["dates"] = None if arg == "any" else [arg, arg]
         wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wk" and state.get("wiz", {}).get("kind") == "f":
+        state["awaiting"] = {"type": "wiz_dates"}
+        edit(*flight_dates_wizard_screen(state["wiz"], date.fromisoformat(arg + "-01")))
+    elif cmd == "we" and state.get("wiz", {}).get("kind") == "f":
+        state["awaiting"] = {"type": "wiz_dates"}
+        edit(f"🎯 {state['wiz']['city']}: {FLIGHT_DATES_HINT[0].lower()}{FLIGHT_DATES_HINT[1:]}",
+             [[("⬅️ К календарю", "wk:" + date.today().strftime("%Y-%m"))]])
+    elif cmd in ("wj", "wf", "wb") and state.get("wiz", {}).get("kind") == "f" \
+            and len(state["wiz"].get("depart", "")) == 10:
+        wiz = state["wiz"]
+        if cmd == "wb":
+            wiz["round_trip"] = arg != "none"
+            wiz.pop("return", None)
+            if arg != "none":
+                wiz["return"] = arg
+            wizard_next(state, settings, tg, token, cfg, message_id)
+        else:
+            state["awaiting"] = {"type": "wiz_fback"}
+            if cmd == "wj":
+                edit(*flight_back_wizard_screen(wiz, date.fromisoformat(arg + "-01")))
+            else:
+                edit(f"🎯 {wiz['city']}: {FLIGHT_BACK_HINT[0].lower()}{FLIGHT_BACK_HINT[1:]}",
+                     [[("⬅️ К календарю", "wj:" + wiz["depart"][:7])]])
     elif cmd == "wc" and state.get("wiz"):
         code, name, country = next(d for d in POPULAR_DESTINATIONS if d[0] == arg)
         wizard_set_city(state, settings, {"code": code, "name": name, "country": country})
         wizard_next(state, settings, tg, token, cfg, message_id)
     elif cmd == "wm" and state.get("wiz"):
         state["wiz"]["depart"] = arg
+        state["wiz"].pop("return", None)
+        state["wiz"].pop("round_trip", None)  # спросим про обратный билет
         wizard_next(state, settings, tg, token, cfg, message_id)
     elif cmd == "wt" and state.get("wiz"):
         state["wiz"]["round_trip"] = arg == "rt"
@@ -2153,7 +2387,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
 
     # Карточка направления
     elif cmd in ("i", "ip", "it", "id", "ik", "iu", "ia", "ij", "il", "io", "ig", "ir", "ic", "ih", "ib",
-                 "ie", "iy", "iv", "iz", "in", "iq", "ix", "iw", "if"):
+                 "ie", "iy", "iv", "iz", "in", "iq", "ix", "iw", "if", "is"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -2173,6 +2407,58 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             tg.send(f"{item['city']}: напиши новую цену, например {example}.",
                     [[("⬅️ Отмена", f"i:{item_id}")]])
             return False
+        elif cmd in ("id", "ik") and kind == "filter":
+            state["awaiting"] = {"type": "item_dates", "id": item_id}
+            # Календарь открываем на месяце текущей даты вылета.
+            month = extra or max(item["depart"][:7], date.today().strftime("%Y-%m"))
+            month = date.fromisoformat(month + "-01")
+            edit(*pick_flight_dates_screen(f"🎯 {item['city']}", f"ia:{item_id}:",
+                                           [("⬅️ Отмена", f"i:{item_id}")], f"ik:{item_id}:",
+                                           f"iu:{item_id}", month))
+            return False
+        elif cmd == "iu" and kind == "filter":
+            state["awaiting"] = {"type": "item_dates", "id": item_id}
+            edit(f"🎯 {item['city']}: {FLIGHT_DATES_HINT[0].lower()}{FLIGHT_DATES_HINT[1:]}",
+                 [[("⬅️ К календарю", f"id:{item_id}")]])
+            return False
+        elif cmd == "ia" and kind == "filter" and extra:
+            item["depart"] = extra
+            item.pop("return", None)
+            item.pop("last_price", None)
+            if len(extra) == 10:  # день вылета выбран — теперь когда обратно
+                state["awaiting"] = {"type": "item_fback", "id": item_id}
+                edit(*filter_back_screen(item))
+                return False
+            note = f"✅ Вылет: в {MONTH_IN[int(extra[5:])]}\n"
+        elif cmd in ("ij", "il") and kind == "filter" and len(item["depart"]) == 10:
+            state["awaiting"] = {"type": "item_fback", "id": item_id}
+            edit(*filter_back_screen(item, date.fromisoformat(extra + "-01") if cmd == "il" else None))
+            return False
+        elif cmd in ("ij", "il") and kind == "route":
+            state["awaiting"] = {"type": "item_back", "id": item_id}
+            edit(*pick_flight_back_screen(f"↩️ {item['city']}", None, f"ig:{item_id}:",
+                                          [("⬅️ Назад", f"ib:{item_id}")], f"il:{item_id}:",
+                                          f"ie:{item_id}",
+                                          date.fromisoformat(extra + "-01") if cmd == "il" else None))
+            return False
+        elif cmd == "io" and kind == "filter" and len(item["depart"]) == 10:
+            state["awaiting"] = {"type": "item_fback", "id": item_id}
+            edit(f"🎯 {item['city']}: {FLIGHT_BACK_HINT[0].lower()}{FLIGHT_BACK_HINT[1:]}",
+                 [[("⬅️ К календарю", f"ij:{item_id}")]])
+            return False
+        elif cmd == "ig" and kind == "filter" and len(item["depart"]) == 10 and extra:
+            set_filter_back(item, extra)
+            note = "✅ " + dates_text(item).capitalize() + ("" if item["round_trip"] else ", только туда") + "\n"
+        elif cmd == "ig" and kind == "route" and extra:
+            item["back"] = {"dates": [extra, extra]}
+            note = "✅ Обратно: " + back_text(item) + "\n"
+        elif cmd == "is":
+            item["bag"] = not item.get("bag")
+            if not item["bag"]:
+                item.pop("bag")
+            item.pop("last_price", None)
+            note = ("✅ Ищу только билеты с багажом\n" if item.get("bag")
+                    else "✅ Багаж не важен: показываю все билеты\n")
         elif cmd in ("id", "ik") and kind == "train":
             state["awaiting"] = {"type": "item_dates", "id": item_id}
             month = date.fromisoformat(extra + "-01") if cmd == "ik" else None
@@ -2206,13 +2492,11 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             set_train_back(item, None if extra == "none" else [extra, extra])
             note = "✅ Обратно: " + (train_dates_short(item, "back_dates") if item.get("back_dates")
                                     else "не нужно") + "\n"
-        elif cmd == "id":
-            state["awaiting"] = {"type": "item_dates", "id": item_id}
-            tg.send(f"🎯 {item['city']}: напиши новые даты, например 15.12-25.12, 20.11 или декабрь.",
-                    [[("⬅️ Отмена", f"i:{item_id}")]])
-            return False
         elif cmd == "ir":
             item["round_trip"] = not item.get("round_trip")
+            if not item["round_trip"]:
+                item.pop("return", None)
+            item.pop("last_price", None)
         elif cmd == "ic":
             item["direct"] = not item.get("direct")
         elif cmd == "ib":
@@ -2278,7 +2562,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                     + day_parts_text(item, offers, 3) + note,
                     train_day_buttons(offers) + back)
             return False
-        elif cmd == "iw" and kind == "train":
+        elif cmd == "iw":
             field, _, code = extra.partition(":")
             if field in ("times", "back_times") and code:
                 chosen = set(item.get(field) or [])
@@ -2290,19 +2574,21 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                 else:
                     item.pop(field, None)
                 item.pop("last_price", None)
-            edit(*train_times_screen(item))
+            edit(*times_screen(kind, item))
             return False
         elif cmd == "if":
-            note = "✅ Время отправления: " + times_text(item.get("times"))
-            if item.get("back_dates"):
+            note = ("✅ Время отправления: " if kind == "train" else "✅ Время вылета: ") \
+                + times_text(item.get("times"))
+            if item.get("back_dates") or kind != "train":
                 note += ", обратно: " + times_text(item.get("back_times"))
             note += "\n"
         elif cmd == "in":
             tg.send("🔎 Ищу цены…")
             all_offers, offers = item_offers(token, kind, item, cfg)
             remember_price(item, offers, datetime.now(timezone.utc))
-            back = [[("⬅️ К направлению", f"i:{item_id}")]]
-            note = skipped_note(all_offers, offers)
+            back = [[("🕐 Время вылета: " + flight_times_label(item), f"iw:{item_id}")],
+                    [("⬅️ К направлению", f"i:{item_id}")]]
+            note = skipped_note(all_offers, offers, item)
             if not offers:
                 tg.send(f"{item['city']}: билетов не нашёл 😔" + (f"\n\n{note}" if note else ""), back)
                 return False
@@ -2320,6 +2606,16 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                 text += (f"\n\n⚡ Быстрее: {fmt_price(fast['price'])} ₽\n"
                          f"{offer_line(fast, item['origin_name'], item)}")
                 buttons.append([("⚡ Купить быстрый", offer_link(fast))])
+            parts = flight_parts(offers)
+            if len(parts) > 1:
+                text += ("\n\n🕐 Самые дешёвые по времени вылета:\n"
+                         + "\n".join(f"{day_part_label(c)}: {flight_short(o)}" for c, o in parts))
+                part_btns = [(f"🎫 {DAY_PART_NAMES[c]} · {k(o['price'])}", offer_link(o)) for c, o in parts]
+                buttons += rows(part_btns, 2)
+            if item.get("times") or item.get("back_times"):
+                text += ("\n\n🕐 Показываю только вылет: " + times_text(item.get("times"))
+                         + ", обратно: " + times_text(item.get("back_times"))
+                         + ". Поменять — кнопка «🕐 Время вылета».")
             if note:
                 text += f"\n\n{note}"
             tg.send(text, buttons + back)
@@ -2334,7 +2630,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                    else origin_screen(settings, item["origin"])))
             return False
         edit(*item_screen(settings, item_id, note))
-        return cmd in ("ip", "ir", "ic", "ih", "iv", "ia", "ig", "if")
+        return cmd in ("ip", "ir", "ic", "ih", "iv", "ia", "ig", "if", "is")
 
     # Цены
     elif cmd in ("p", "pa"):
