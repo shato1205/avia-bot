@@ -1,43 +1,26 @@
-"""Временная проверка: время вылета, багаж и календарь подбора на живых ценах."""
+"""Временная проверка: отложенные билеты находятся снова на живых ценах."""
 import os, sys
+from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import check_prices as c
 
-
-class TG(c.Telegram):
-    def call(self, method, http_timeout=30, **p):
-        if method in ("sendMessage", "editMessageText"):
-            print(f"--- {method} ({len(p['text'])} знаков)\n{p['text']}")
-            for row in (p.get("reply_markup") or {}).get("inline_keyboard", []):
-                print("   [" + "] [".join(b["text"] for b in row) + "]")
-        return {"ok": True}
-
-
-tg = TG("x", "1")
 token = os.environ["TRAVELPAYOUTS_TOKEN"]
-cfg = {"months_ahead": 3, "history_days": 30, "drop_percent": 30, "realert_hours": 24}
-hkt = {"id": "r1", "name": "ТАИЛАНД (Пхукет)", "destination": "HKT", "city": "Пхукет", "origin": "MOW",
-       "origin_name": "Москва", "max_price": 25000}
-ayt = {"id": "r2", "name": "ТУРЦИЯ (Анталья)", "destination": "AYT", "city": "Анталья", "origin": "MOW",
-       "origin_name": "Москва", "max_price": 10000}
-flt = {"id": "f1", "name": "ОАЭ (Дубай)", "destination": "DXB", "city": "Дубай", "origin": "MOW",
-       "origin_name": "Москва", "max_price": 60000, "depart": "2026-11-14", "return": "2026-11-21",
-       "round_trip": True}
-settings = {"origin": "MOW", "origin_name": "Москва", "routes": [hkt, ayt], "filters": [flt], "trains": []}
-c.ensure_origins(settings)
-for title, setup in (("все", {}), ("Анталья только утро+день, обратно вечер", {"times": ["m", "d"], "back_times": ["e"]}),
-                     ("Анталья только с багажом", {"bag": True})):
-    ayt.pop("times", None); ayt.pop("back_times", None); ayt.pop("bag", None)
-    ayt.update(setup)
-    print(f"########## {title}")
-    c.handle_button("in:r2", 1, {}, settings, tg, token, cfg)
-print("########## Пхукет все")
-c.handle_button("in:r1", 1, {}, settings, tg, token, cfg)
-print("########## Подбор Дубай 14.11-21.11")
-c.handle_button("in:f1", 1, {}, settings, tg, token, cfg)
-flt["times"] = ["e"]
-print("########## Подбор Дубай, вылет вечером")
-c.handle_button("in:f1", 1, {}, settings, tg, token, cfg)
-# багаж: статистика по тарифам
+now = datetime.now(timezone.utc)
+item = {"origin": "MOW", "destination": "AYT", "origin_name": "Москва", "city": "Анталья"}
 offers = c.route_offers(token, "MOW", {"destination": "AYT", "max_hours": 0}, {"months_ahead": 2})
-print("BAG", {k: sum(1 for o in offers if c.has_bag(o) is k) for k in (True, False, None)}, len(offers))
+offers.sort(key=lambda o: o["price"])
+for o in offers[:3] + offers[10:12]:
+    snap = c.flight_snapshot(o, "MOW", "AYT", "Москва", "Анталья")
+    s = dict(snap, id="x", saved=now.isoformat())
+    print("FLIGHT", snap["label"], "->", c.recheck_saved(token, s, now))
+rt = c.fetch_cheapest(token, "MOW", "DXB", "2026-11-14", "2026-11-21", one_way=False)
+for o in sorted(rt, key=lambda o: o["price"])[:2]:
+    s = dict(c.flight_snapshot(o, "MOW", "DXB", "Москва", "Дубай"), id="y", saved=now.isoformat())
+    print("RT", s["label"], "->", c.recheck_saved(token, s, now))
+t = {"from": "2000000", "to": "2004000", "from_name": "Москва", "to_name": "Санкт-Петербург",
+     "car": "any", "dates": ["2026-10-23", "2026-10-23"], "back_dates": ["2026-10-26", "2026-10-26"]}
+both = c.train_both(t)
+pair = c.train_trip_offers(t, both)[0]
+for o, back in [(pair, False), (sorted(both[0], key=lambda o: o["price"])[5], False), (both[1][3], True)]:
+    s = dict(c.train_snapshot(o, t, back), id="z", saved=now.isoformat())
+    print("TRAIN", s["label"], "->", c.recheck_saved(token, s, now), "seats", s.get("seats"))

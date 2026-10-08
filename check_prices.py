@@ -43,7 +43,8 @@ TUTU = "https://www.tutu.ru"
 
 BTN_HOME = "🏠 Меню"
 BTN_PRICES = "💰 Цены сейчас"
-MENU = [[BTN_HOME, BTN_PRICES]]
+BTN_SAVED = "⭐ Отложенные"
+MENU = [[BTN_HOME, BTN_PRICES, BTN_SAVED]]
 # Кнопки из старой версии меню: могут остаться на клавиатуре до первого ответа бота.
 OLD_BUTTONS = {"🛫 Откуда лечу", "➕ Добавить направление", "📋 Мои направления",
                "➖ Удалить направление", "🎯 Подбор по датам"}
@@ -640,11 +641,241 @@ def format_alert(route, offer, reason, origin_name, extra="", who="ГОША СР
     )
 
 
-def alert_buttons(item, link=None, rt=None):
+def alert_buttons(item, link=None, rt=None, pick=None):
     buy = [[("🎫 Купить билет", link)]] if link else []
     if rt:
         buy.append([("🔁 Купить туда-обратно", offer_link(rt))])
+    buy += pick or []
     return buy + [[("⚙️ Настроить", f"i:{item['id']}"), ("⏸ Пауза", f"iz:{item['id']}")]]
+
+
+# ---------- ⭐ Отложенные билеты ----------
+
+SAVED_MAX = 50  # больше в корзине не храним
+SAVED_RECHECK_HOURS = 2  # как часто сами проверяем цену отложенных
+
+
+def flight_snapshot(o, origin, dest, from_name, to_name):
+    """Билет на самолёт для «⭐ Отложенных»: что показать, где купить и как проверить цену."""
+    rt = bool(o.get("return_at"))
+    arrow = "⇄" if rt else "→"
+    when = short_date(o["departure_at"]) + (f" – {short_date(o['return_at'])}" if rt else "")
+    return {"kind": "flight", "title": f"✈️ {from_name} {arrow} {to_name}",
+            "label": f"✈️ {from_name}{arrow}{to_name} · {fmt_price(o['price'])} ₽ · {when}",
+            "text": f"Вылет {short_date(o['departure_at'])}"
+                    + (f", обратно {short_date(o['return_at'])}" if rt else "") + "\n" + trip_details(o),
+            "price": o["price"], "date": o["departure_at"][:10],
+            "links": [["🎫 Купить билет", offer_link(o)]],
+            "check": {"type": "f", "origin": origin, "dest": dest, "dep": o["departure_at"][:16],
+                      "ret": o.get("return_at", "")[:16], "airline": o.get("airline", "")}}
+
+
+def item_flight_snaps(item, offers, back=None):
+    """Снимки билетов направления: «туда» (и туда-обратно) из offers, обратные — из back."""
+    there = [flight_snapshot(o, item["origin"], item["destination"], item["origin_name"], item["city"])
+             for o in offers if o]
+    return there + [flight_snapshot(o, item["destination"], item["origin"], item["city"], item["origin_name"])
+                    for o in back or [] if o]
+
+
+def train_snapshot(o, t, back=False):
+    """Билет на поезд (или пара туда-обратно) для «⭐ Отложенных». Без даты — None.
+
+    back=True — это одиночный билет обратно (из города t["to"] в t["from"]).
+    """
+    pair = "there" in o
+    legs = [o["there"], o["back"]] if pair else [o]
+    if not all(leg.get("date") for leg in legs):
+        return None  # цены «от» без даты: откладывать нечего
+    names = [(t["from"], t["to"], t["from_name"], t["to_name"]), (t["to"], t["from"], t["to_name"], t["from_name"])]
+    if back:
+        names = names[1:]
+    a, b = names[0][2], names[0][3]
+    when = " / ".join(f"{leg['date'][8:]}.{leg['date'][5:7]} {leg['dep_time']}" for leg in legs)
+    car = CAR_NAMES.get(o["car"], o["car"])
+    return {"kind": "train", "title": f"🚆 {a} {'⇄' if pair else '→'} {b}",
+            "label": f"🚆 {a}{'⇄' if pair else '→'}{b} · {fmt_price(o['price'])} ₽ · {when} · {o['train']} {car}",
+            "text": train_pair_text(o, link=False) if pair else train_offer_line(o, False, False),
+            "price": o["price"], "date": legs[0]["date"],
+            "links": ([["🎫 Купить туда", o["there"]["link"]], ["🎫 Купить обратно", o["back"]["link"]]]
+                      if pair else [["🎫 Купить билет", o["link"]]]),
+            "check": {"type": "t", "legs": [{"from": n[0], "to": n[1], "date": leg["date"],
+                                             "train": leg["train"], "car": leg["car"]}
+                                            for n, leg in zip(names, legs)]}}
+
+
+def snap_key(snap):
+    return json.dumps(snap["check"], sort_keys=True, ensure_ascii=False)
+
+
+def pick_button(settings, snaps):
+    """Кнопка «⭐ Отложить» под сообщением с билетами (сами билеты запоминаем в настройках)."""
+    items, seen = [], set()
+    for snap in snaps:
+        if snap and snap_key(snap) not in seen:
+            seen.add(snap_key(snap))
+            items.append(snap)
+    if not items:
+        return []
+    picks = settings.setdefault("picks", {})
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    for token in [t for t, p in picks.items() if p["ts"] < week_ago][:50]:
+        del picks[token]
+    while len(picks) >= 150:  # старые списки выбрасываем
+        del picks[min(picks, key=lambda t: picks[t]["ts"])]
+    token = uuid.uuid4().hex[:8]
+    picks[token] = {"ts": datetime.now(timezone.utc).isoformat(), "items": items}
+    return [[("⭐ Отложить", f"sp:{token}")]]
+
+
+def save_snap(settings, snap):
+    """Кладёт билет в «⭐ Отложенные». Возвращает текст ответа."""
+    saved = settings.setdefault("saved", [])
+    if any(snap_key(x) == snap_key(snap) for x in saved):
+        return "Этот билет уже в отложенных ⭐"
+    if len(saved) >= SAVED_MAX:
+        return f"В отложенных уже {SAVED_MAX} билетов — убери ненужные и попробуй снова."
+    saved.append(dict(snap, id=uuid.uuid4().hex[:6], saved=datetime.now(timezone.utc).isoformat()))
+    return f"⭐ Отложил: {snap['label']}"
+
+
+def find_saved(settings, saved_id):
+    return next((x for x in settings.get("saved", []) if x["id"] == saved_id), None)
+
+
+def saved_now(s):
+    """Последняя известная цена отложенного билета (None — не нашёл в продаже)."""
+    return s["now_price"] if "now_price" in s else s["price"]
+
+
+def diff_text(old, new):
+    if new == old:
+        return "та же цена"
+    return f"{'дешевле' if new < old else 'дороже'} на {fmt_price(abs(new - old))} ₽"
+
+
+def saved_text(s):
+    saved_at = datetime.fromisoformat(s["saved"]).astimezone(MSK).strftime("%d.%m")
+    lines = [f"⭐ {s['title']}", s["text"], "", f"Когда отложил ({saved_at}): {fmt_price(s['price'])} ₽"]
+    if s.get("checked"):
+        ts = datetime.fromisoformat(s["checked"]).astimezone(MSK).strftime("%d.%m %H:%M")
+        now = saved_now(s)
+        if now is None:
+            lines.append(("Сейчас: мест в этом вагоне не вижу" if s["kind"] == "train"
+                          else "Сейчас: этого рейса нет в свежих ценах — проверь по кнопке «Купить»")
+                         + f" (мск {ts})")
+        else:
+            lines.append(f"Сейчас: {fmt_price(now)} ₽, {diff_text(s['price'], now)} (мск {ts})")
+            if s.get("seats"):
+                lines.append(f"Свободных мест: {s['seats']}")
+    return "\n".join(lines)
+
+
+def saved_buttons(s):
+    return [[(label, url) for label, url in s["links"]],
+            [("🔄 Проверить цену", f"sc:{s['id']}"), ("🗑 Убрать", f"sq:{s['id']}")],
+            [("⬅️ Отложенные", "sl")]]
+
+
+def saved_label(s):
+    now = saved_now(s)
+    mark = "" if now is None or now == s["price"] else (" 📉" if now < s["price"] else " 📈")
+    price = "нет мест" if now is None and s["kind"] == "train" else k(now if now is not None else s["price"])
+    icon, _, route = s["title"].partition(" ")
+    return f"{icon} {s['date'][8:]}.{s['date'][5:7]} {route} · {price}{mark}"
+
+
+def saved_screen(settings, note=""):
+    saved = sorted(settings.get("saved", []), key=lambda x: x["date"])
+    lines = [note] if note else []
+    lines.append("⭐ Отложенные билеты\n")
+    if not saved:
+        lines.append("Пока пусто. Под уведомлениями и под «🔎 Цена сейчас» есть кнопка «⭐ Отложить»: "
+                     "нажми её, и билет попадёт сюда, чтобы купить его позже.")
+    else:
+        lines.append("Нажми на билет, чтобы купить его, проверить цену или убрать.\n"
+                     "Раз в пару часов сам проверяю цены и напишу, если отложенный билет подешевеет "
+                     "или на поезд закончатся места. 📉 — подешевел, 📈 — подорожал.")
+    buttons = [[(saved_label(x), f"so:{x['id']}")] for x in saved]
+    if saved:
+        buttons.append([("🔄 Проверить все цены", "sa")])
+    return "\n".join(lines), buttons + [[("⬅️ В меню", "home")]]
+
+
+def pick_screen(settings, token):
+    entry = settings.get("picks", {}).get(token)
+    if not entry:
+        return None
+    keys = {snap_key(x) for x in settings.get("saved", [])}
+    buttons = [[(("✅ " if snap_key(it) in keys else "") + it["label"], f"sv:{token}:{i}")]
+               for i, it in enumerate(entry["items"])]
+    return ("⭐ Какой билет отложить? Можно несколько. Нажми ещё раз, чтобы убрать.",
+            buttons + [[("⭐ Все отложенные", "sl")]])
+
+
+def recheck_saved(token, s, now):
+    """Узнаёт свежую цену отложенного билета. (старая цена, новая цена) или None при ошибке."""
+    c = s["check"]
+    try:
+        if c["type"] == "f":
+            offers = fetch_cheapest(token, c["origin"], c["dest"], c["dep"][:10], c["ret"][:10] or None,
+                                    one_way=not c["ret"], limit=100)
+            same = [o for o in offers if o["departure_at"][:16] == c["dep"]
+                    and o.get("airline", "") == c["airline"] and o.get("return_at", "")[:16] == c["ret"]]
+            new = min((o["price"] for o in same), default=None)
+            if same:
+                s["links"][0][1] = offer_link(min(same, key=lambda o: o["price"]))
+        else:
+            new, seats = 0, []
+            for i, leg in enumerate(c["legs"]):
+                if i:
+                    time.sleep(1)
+                same = [o for o in fetch_train_day(leg["from"], leg["to"], leg["date"])
+                        if o["train"] == leg["train"] and o["car"] == leg["car"]]
+                if not same:
+                    new = None
+                    break
+                cheapest = min(same, key=lambda o: o["price"])
+                new += cheapest["price"]
+                seats.append(cheapest.get("seats", 0))
+            s["seats"] = min(seats) if new else 0
+    except Exception as e:  # noqa: BLE001
+        print(f"saved check error {s.get('title')}: {e!r}", file=sys.stderr)
+        return None
+    old = saved_now(s)
+    s["now_price"] = new
+    s["checked"] = now.isoformat()
+    return old, new
+
+
+def check_saved(tg, token, settings, now):
+    """Следит за отложенными: убирает прошедшие, пишет, если подешевели или кончились места."""
+    today = now.astimezone(MSK).date().isoformat()
+    sent, checked = 0, 0
+    for s in list(settings.get("saved", [])):
+        if s["date"] < today:
+            settings["saved"].remove(s)
+            tg.send(f"⌛ Убрал из отложенных, дата прошла: {saved_label(s)}")
+            continue
+        last = s.get("checked")
+        if checked >= 15 or last and now - datetime.fromisoformat(last) < timedelta(hours=SAVED_RECHECK_HOURS):
+            continue
+        checked += 1
+        res = recheck_saved(token, s, now)
+        if not res:
+            continue
+        old, new = res
+        head = ""
+        if new is not None and old is not None and new <= old - 100:
+            head = f"📉 Отложенный билет подешевел: {fmt_price(old)} → {fmt_price(new)} ₽"
+        elif new is None and old is not None and s["kind"] == "train":
+            head = "⚠️ На отложенный поезд в этом вагоне больше нет мест"
+        elif new is not None and old is None and s["kind"] == "train":
+            head = f"✅ На отложенный поезд снова есть места: {fmt_price(new)} ₽"
+        if head:
+            tg.send(f"{head}\n\n{saved_text(s)}", saved_buttons(s))
+            sent += 1
+    return sent
 
 
 def remember_price(item, offers, now):
@@ -679,7 +910,8 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             rt, back = return_info(token, origin, route["destination"], o, route)
             tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route),
                                  shout(settings)),
-                    alert_buttons(route, offer_link(o), rt))
+                    alert_buttons(route, offer_link(o), rt,
+                                  pick_button(settings, item_flight_snaps(route, [o, rt], [back]))))
             sent[sent_key] = now.isoformat()
             alerts += 1
 
@@ -705,16 +937,18 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
             continue
         kind = " туда-обратно" if f.get("round_trip") else ""
-        rt = extra = None
+        rt = back = extra = None
         if not f.get("round_trip"):
             rt, back = return_info(token, origin, f["destination"], o, f)
             extra = return_text(o, rt, back, f)
         tg.send(f"🎯 {shout(settings)} {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
                 f"{offer_line(o, f['origin_name'], f)}\n" + (f"{extra}\n" if extra else "")
-                + f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o), rt))
+                + f"Подбор: {filter_text(f)}",
+                alert_buttons(f, offer_link(o), rt, pick_button(settings, item_flight_snaps(f, [o, rt], [back]))))
         sent[sent_key] = now.isoformat()
         alerts += 1
     alerts += check_trains(tg, cfg, settings, history, sent, now)
+    alerts += check_saved(tg, token, settings, now)
     print(f"Отправлено алертов: {alerts}")
 
 
@@ -753,7 +987,7 @@ def check_trains(tg, cfg, settings, history, sent, now):
             else:
                 text = (f"🚆 {shout(settings)} ПОЕЗД {t['from_name']} → {t['to_name']} "
                         f"{fmt_price(o['price'])} ₽\n{train_offer_line(o)}\nПочему: {reason}")
-            tg.send(text, train_buy_buttons(o) + alert_buttons(t))
+            tg.send(text, train_buy_buttons(o) + alert_buttons(t, pick=pick_button(settings, [train_snapshot(o, t)])))
             sent[sent_key] = now.isoformat()
             alerts += 1
         add_history(history, key, offers, cfg, now)
@@ -792,8 +1026,12 @@ def grouped_items(settings):
     return [groups[o] for o in order if o in groups]
 
 
-def prices_now(token, cfg, settings, origin=None):
-    """Цены по направлениям. origin — только этот город вылета (без поездов)."""
+def prices_now(token, cfg, settings, origin=None, snaps=None):
+    """Цены по направлениям. origin — только этот город вылета (без поездов).
+
+    snaps — список, куда сложить показанные билеты для кнопки «⭐ Отложить».
+    """
+    snaps = [] if snaps is None else snaps
     lines = [f"💰 Самые дешёвые билеты на {cfg['months_ahead']} мес.:"]
     groups = grouped_items(settings)
     if origin:
@@ -817,13 +1055,15 @@ def prices_now(token, cfg, settings, origin=None):
                                     for c, o in parts) + (f"\n{note}" if note else ""))
             best = min(offers, key=lambda o: o["price"])
             back_line = ""
+            rt = back = None
             if not item.get("round_trip"):
                 rt, back = return_info(token, item["origin"], item["destination"], best, item)
                 back_line = "\n" + return_text(best, rt, back, item)
+            snaps += item_flight_snaps(item, [best, rt], [back])
             lines.append(f"{title}: {fmt_price(best['price'])} ₽\n"
                          f"{offer_line(best, origin_name, item)}{back_line}" + (f"\n{note}" if note else ""))
     if trains:
-        lines.append("\n" + train_prices(settings))
+        lines.append("\n" + train_prices(settings, snaps))
     return "\n".join(lines)
 
 
@@ -1174,7 +1414,8 @@ def train_dates_short(t, field="dates"):
     return a if a == b else f"{a}–{b}"
 
 
-def train_prices(settings):
+def train_prices(settings, snaps=None):
+    snaps = [] if snaps is None else snaps
     lines = ["🚆 Поезда:"]
     trains = settings.get("trains", [])
     if not trains:
@@ -1187,6 +1428,7 @@ def train_prices(settings):
             lines.append(f"\n{train_title(t)}{times}: билетов не нашёл")
             continue
         best = min(offers, key=lambda o: o["price"])
+        snaps.append(train_snapshot(best, t))
         if "there" in best:
             lines.append(f"\n{train_title(t)}{times}: от {fmt_price(best['price'])} ₽ туда-обратно\n"
                          f"➡️ Туда:\n{day_parts_text(t, both[0], 1)}\n"
@@ -1399,6 +1641,16 @@ def add_route(settings, text):
     return "\n".join(replies) or "Напиши город, например: Пхукет 20000", changed
 
 
+NEWS_ID = "2026-10-08-saved"  # поменять, когда будет что рассказать о новом
+NEWS = ("🆕 Бот обновился:\n\n"
+        "⭐ Отложенные билеты. Под уведомлениями и под «🔎 Цена сейчас» есть кнопка «⭐ Отложить», "
+        "а внизу — кнопка «⭐ Отложенные»: там билеты можно купить, проверить цену или убрать. "
+        "Я сам слежу за их ценой и напишу, если отложенный билет подешевеет.\n\n"
+        "✈️ В «🎯 Подбор по датам» даты выбираются в календаре. В карточке направления есть "
+        "«🕐 Время вылета» (утро, день, вечер, ночь) и «🧳 С багажом».\n\n"
+        "🚆 У поездов можно выбрать время отправления, а «Цена сейчас» показывает поезда "
+        "утром, днём, вечером и ночью.")
+
 HELP = (
     "Я слежу за ценами на авиабилеты и билеты на поезда и пишу, когда находится дешёвый билет.\n\n"
     "Всё настраивается кнопками в меню 🏠. А ещё можно писать одной строкой:\n"
@@ -1524,6 +1776,7 @@ def home_screen(settings):
     lines.append("\nНажми на город вылета или на «🚆 Поезда», чтобы настроить направления.")
     buttons.append([("➕ Город вылета", "no"), ("💰 Все цены", "pa")])
     buttons.append([(f"🚆 Поезда  ({len(trains)})", "t")])
+    buttons.append([(f"⭐ Отложенные  ({len(settings.get('saved', []))})", "sl")])
     if settings.get("owner"):
         buttons.append([("👥 Друзья", "users")])
     return "\n".join(lines), buttons
@@ -2090,7 +2343,12 @@ def handle(text, state, settings, tg, token, cfg):
         return False
     if text == BTN_PRICES:
         tg.send("🔎 Ищу цены…")
-        tg.send(prices_now(token, cfg, settings), back_button(settings, None))
+        snaps = []
+        tg.send(prices_now(token, cfg, settings, snaps=snaps),
+                pick_button(settings, snaps) + back_button(settings, None))
+        return False
+    if text == BTN_SAVED:
+        tg.send(*saved_screen(settings))
         return False
 
     for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("подбор ", "filter")):
@@ -2283,7 +2541,9 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*trains_screen(settings))
     elif cmd == "tp":
         tg.send("🔎 Ищу цены…")
-        tg.send(train_prices(settings), [[("⬅️ Поезда", "t")]])
+        snaps = []
+        text = train_prices(settings, snaps)
+        tg.send(text, pick_button(settings, snaps) + [[("⬅️ Поезда", "t")]])
     elif cmd == "o" and select_origin(settings, arg):
         edit(*origin_screen(settings, arg))
 
@@ -2547,20 +2807,24 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                 return False
             if "there" in offers[0]:
                 o = offers[0]
+                snaps = ([train_snapshot(o, item)]
+                         + [train_snapshot(x, item) for _, g in by_day_part(both[0], 2) for x in g]
+                         + [train_snapshot(x, item, back=True) for _, g in by_day_part(both[1], 2) for x in g])
                 tg.send(f"💰 {train_title(item)}: от {fmt_price(o['price'])} ₽ туда-обратно{times}\n\n"
                         "Самая дешёвая пара:\n" + train_pair_text(o, link=False)
                         + "\n\n➡️ Туда, по времени суток:\n" + day_parts_text(item, both[0], 2)
                         + "\n\n⬅️ Обратно, по времени суток:\n"
                         + day_parts_text(train_back_item(item), both[1], 2),
-                        train_buy_buttons(o) + back)
+                        train_buy_buttons(o) + pick_button(settings, snaps) + back)
                 return False
             best = min(offers, key=lambda o: o["price"])
             note = ("" if item.get("dates")
                     else "\n\nЭто цены «от»: даты и места смотри на Туту.ру")
+            snaps = [train_snapshot(x, item) for _, g in by_day_part(offers, 3) for x in g]
             tg.send(f"💰 {train_title(item)}: от {fmt_price(best['price'])} ₽{times}\n"
                     "Самые дешёвые поезда по времени отправления:\n\n"
                     + day_parts_text(item, offers, 3) + note,
-                    train_day_buttons(offers) + back)
+                    train_day_buttons(offers) + pick_button(settings, snaps) + back)
             return False
         elif cmd == "iw":
             field, _, code = extra.partition(":")
@@ -2595,6 +2859,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             best = min(offers, key=lambda o: o["price"])
             text = f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n{offer_line(best, item['origin_name'], item)}"
             buttons = [[("🎫 Купить билет", offer_link(best))]]
+            rt = ret = None
             if not item.get("round_trip"):
                 rt, ret = return_info(token, item["origin"], item["destination"], best, item)
                 text += "\n" + return_text(best, rt, ret, item)
@@ -2618,7 +2883,8 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                          + ". Поменять — кнопка «🕐 Время вылета».")
             if note:
                 text += f"\n\n{note}"
-            tg.send(text, buttons + back)
+            snaps = item_flight_snaps(item, [best, rt, fast] + [o for _, o in parts], [ret])
+            tg.send(text, buttons + pick_button(settings, snaps) + back)
             return False
         elif cmd == "iq":
             edit(f"Удалить {item_label(kind, item)}?",
@@ -2632,10 +2898,74 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*item_screen(settings, item_id, note))
         return cmd in ("ip", "ir", "ic", "ih", "iv", "ia", "ig", "if", "is")
 
+    # ⭐ Отложенные
+    elif cmd == "sl":
+        edit(*saved_screen(settings))
+    elif cmd == "sp":
+        entry = settings.get("picks", {}).get(arg)
+        if not entry:
+            tg.send("Этот список устарел. Открой «🔎 Цена сейчас» ещё раз.", [[("⭐ Отложенные", "sl")]])
+        elif len(entry["items"]) == 1:
+            tg.send(save_snap(settings, entry["items"][0]) + "\nВсе отложенные — кнопка «⭐ Отложенные».",
+                    [[("⭐ Отложенные", "sl")]])
+        else:
+            tg.send(*pick_screen(settings, arg))
+    elif cmd == "sv":
+        pick_id, _, idx = arg.partition(":")
+        entry = settings.get("picks", {}).get(pick_id)
+        if not entry or not idx.isdigit() or int(idx) >= len(entry["items"]):
+            edit("Этот список устарел. Открой «🔎 Цена сейчас» ещё раз.", [[("⭐ Отложенные", "sl")]])
+            return False
+        snap = entry["items"][int(idx)]
+        same = [x for x in settings.get("saved", []) if snap_key(x) == snap_key(snap)]
+        if same:
+            settings["saved"].remove(same[0])  # повторное нажатие — убрать из отложенных
+        else:
+            save_snap(settings, snap)
+        edit(*pick_screen(settings, pick_id))
+    elif cmd in ("so", "sc", "sq", "sd"):
+        s = find_saved(settings, arg)
+        if not s:
+            edit(*saved_screen(settings, "Этого билета уже нет в отложенных.\n"))
+        elif cmd == "so":
+            edit(saved_text(s), saved_buttons(s))
+        elif cmd == "sc":
+            res = recheck_saved(token, s, datetime.now(timezone.utc))
+            if not res:
+                note = "Не получилось проверить цену, попробуй позже.\n\n"
+            elif res[1] is None:
+                note = ("😔 Мест в этом вагоне больше нет.\n\n" if s["kind"] == "train"
+                        else "😔 Этого рейса сейчас нет в свежих ценах.\n\n")
+            else:
+                note = (f"🔄 Проверил: {fmt_price(res[1])} ₽ — "
+                        + ("столько же, сколько когда отложил" if res[1] == s["price"]
+                           else diff_text(s["price"], res[1]) + ", чем когда отложил") + ".\n\n")
+            edit(note + saved_text(s), saved_buttons(s))
+        elif cmd == "sq":
+            edit(f"Убрать из отложенных?\n\n{saved_label(s)}",
+                 [[("🗑 Да, убрать", f"sd:{s['id']}"), ("Отмена", f"so:{s['id']}")]])
+        else:
+            settings["saved"].remove(s)
+            edit(*saved_screen(settings, f"🗑 Убрал: {saved_label(s)}\n"))
+    elif cmd == "sa":
+        tg.send("🔎 Проверяю цены отложенных…")
+        now, counts = datetime.now(timezone.utc), {"down": 0, "up": 0, "same": 0, "gone": 0}
+        for s in settings.get("saved", []):
+            res = recheck_saved(token, s, now)
+            if res:
+                new = res[1]
+                counts["gone" if new is None else "down" if new < s["price"]
+                       else "up" if new > s["price"] else "same"] += 1
+        note = (f"🔄 Проверил. Подешевели: {counts['down']}, подорожали: {counts['up']}, "
+                f"та же цена: {counts['same']}, не нашёл: {counts['gone']}.\n")
+        tg.send(*saved_screen(settings, note))
+
     # Цены
     elif cmd in ("p", "pa"):
         tg.send("🔎 Ищу цены…")
-        tg.send(prices_now(token, cfg, settings, arg or None), back_button(settings, arg or None))
+        snaps = []
+        text = prices_now(token, cfg, settings, arg or None, snaps)
+        tg.send(text, pick_button(settings, snaps) + back_button(settings, arg or None))
     else:
         edit(*home_screen(settings))
     return False
@@ -2734,7 +3064,7 @@ class Bot:
             "origin": self.cfg["origin"],
             "origin_name": self.cfg.get("origin_name", self.cfg["origin"]),
             "routes": [], "filters": [], "trains": [],
-            "shout": first.upper() if first else "ЭЙ",
+            "shout": first.upper() if first else "ЭЙ", "news": NEWS_ID,
         })
 
     def stranger(self, uid, chat):
@@ -2839,8 +3169,22 @@ class Bot:
                                  back_button(user.settings, None))
         return changed
 
+    def tell_news(self):
+        """Один раз после обновления рассказываем, что нового (и обновляем кнопки внизу)."""
+        for user in self.users.values():
+            if user.settings.get("news") == NEWS_ID:
+                continue
+            try:
+                user.tg.send(NEWS)
+                user.settings["news"] = NEWS_ID
+            except Exception as e:  # noqa: BLE001
+                print(f"news error {user.chat_id}: {e!r}", file=sys.stderr)
+
     def step(self, wait=0):
         """Один проход: сообщения, затем (если пора) проверка цен, затем сохранение."""
+        if not getattr(self, "news_told", False):
+            self.news_told = True
+            self.tell_news()
         changed = self.process_messages(wait)
         now = datetime.now(timezone.utc)
         state = self.owner.state
