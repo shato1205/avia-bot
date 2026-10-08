@@ -1,0 +1,14 @@
+{
+  "origin": "MOW",
+  "months_ahead": 3,
+  "drop_percent": 30,
+  "history_days": 30,
+  "realert_hours": 24,
+  "routes": [
+    {"name": "ТАИЛАНД (Пхукет)", "destination": "HKT", "max_price": 25000},
+    {"name": "ТАИЛАНД (Бангкок)", "destination": "BKK", "max_price": 25000},
+    {"name": "ВЬЕТНАМ (Нячанг)", "destination": "CXR", "max_price": 25000},
+    {"name": "ТУРЦИЯ (Анталья)", "destination": "AYT", "max_price": 10000},
+    {"name": "ОАЭ (Дубай)", "destination": "DXB", "max_price": 12000}
+  ]
+}
