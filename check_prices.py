@@ -8,6 +8,7 @@
 если с прошлой проверки прошло check_every_minutes, проверяет цены и шлёт алерты.
 Настройки, история цен и состояние хранятся в data/*.json.
 """
+import gzip
 import json
 import os
 import re
@@ -34,6 +35,8 @@ PRICES_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 PLACES_URL = "https://autocomplete.travelpayouts.com/places2"
 # Расписание и цены «от» Туту.ру (без даты). Сайты РЖД и Туту с зарубежных серверов не открываются.
 TRAINS_URL = "https://suggest.travelpayouts.com/search"
+# Точные цены и места на конкретную дату — тот же запрос, что делает сайт Туту.ру.
+TUTU_OFFERS_URL = "https://offers-api.tutu.ru/railway/offers"
 TUTU = "https://www.tutu.ru"
 
 BTN_HOME = "🏠 Меню"
@@ -60,6 +63,19 @@ def http_get_json(url):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def http_post_json(url, body, headers):
+    h = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36",
+         "Accept": "application/json", "Accept-Encoding": "gzip", "Content-Type": "application/json"}
+    h.update(headers)
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
 def fmt_price(n):
     return f"{n:,}".replace(",", " ")
 
@@ -82,11 +98,11 @@ class Telegram:
 
     @staticmethod
     def _markup(buttons):
-        """buttons: [[(текст, callback_data), ...], ...] → кнопки под сообщением."""
+        """buttons: [[(текст, callback_data или https-ссылка), ...], ...] → кнопки под сообщением."""
         if buttons is None:
             return {"keyboard": MENU, "resize_keyboard": True}
-        return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row]
-                                    for row in buttons]}
+        return {"inline_keyboard": [[{"text": t, "url" if d.startswith("https://") else "callback_data": d}
+                                     for t, d in row] for row in buttons]}
 
     def send(self, text, buttons=None):
         self.call("sendMessage", chat_id=self.chat_id, text=text,
@@ -196,13 +212,16 @@ def filter_offers(token, origin, f):
                           one_way=not f.get("round_trip"), direct=f.get("direct", False))
 
 
+def offer_link(offer):
+    return "https://www.aviasales.ru" + offer.get("link", "")
+
+
 def offer_line(offer, origin_name, route):
     dep = offer["departure_at"][:10]
     stops = offer.get("transfers", 0) + offer.get("return_transfers", 0)
     stops_txt = "прямой" if stops == 0 else f"пересадок: {stops}"
     ret = f", обратно {offer['return_at'][:10]}" if offer.get("return_at") else ""
-    link = "https://www.aviasales.ru" + offer.get("link", "")
-    return f"{origin_name} → {route['city']}, вылет {dep}{ret}, {stops_txt}\n{link}"
+    return f"{origin_name} → {route['city']}, вылет {dep}{ret}, {stops_txt}\n{offer_link(offer)}"
 
 
 def format_alert(route, offer, reason, origin_name):
@@ -213,8 +232,9 @@ def format_alert(route, offer, reason, origin_name):
     )
 
 
-def alert_buttons(item):
-    return [[("⚙️ Настроить", f"i:{item['id']}"), ("⏸ Пауза", f"iz:{item['id']}")]]
+def alert_buttons(item, link=None):
+    buy = [[("🎫 Купить билет", link)]] if link else []
+    return buy + [[("⚙️ Настроить", f"i:{item['id']}"), ("⏸ Пауза", f"iz:{item['id']}")]]
 
 
 def remember_price(item, offers, now):
@@ -244,7 +264,8 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             last = sent.get(sent_key)
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
-            tg.send(format_alert(route, o, reason, route["origin_name"]), alert_buttons(route))
+            tg.send(format_alert(route, o, reason, route["origin_name"]),
+                    alert_buttons(route, offer_link(o)))
             sent[sent_key] = now.isoformat()
             alerts += 1
 
@@ -272,7 +293,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         kind = " туда-обратно" if f.get("round_trip") else ""
         tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
                 f"{offer_line(o, f['origin_name'], f)}\n"
-                f"Подбор: {filter_text(f)}", alert_buttons(f))
+                f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o)))
         sent[sent_key] = now.isoformat()
         alerts += 1
     alerts += check_trains(tg, cfg, settings, history, sent, now)
@@ -288,25 +309,29 @@ def add_history(history, key, offers, cfg, now):
 
 def check_trains(tg, cfg, settings, history, sent, now):
     alerts = 0
-    for t in settings.get("trains", []):
+    for t in list(settings.get("trains", [])):
+        if t.get("dates") and t["dates"][1] < now.astimezone(MSK).date().isoformat():
+            settings["trains"].remove(t)
+            tg.send(f"⌛ Даты прошли, убрал поезд: {item_label('train', t)}")
+            continue
         if t.get("paused"):
             continue
-        offers, link = train_offers(t)
+        offers = train_offers(t)
         if not offers:
             continue
         remember_price(t, offers, now)
-        key = f"T|{t['from']}-{t['to']}|{t.get('car', 'any')}"
+        key = train_key(t)
         deals = sorted(find_deals(t, offers, history.get(key, []), cfg, now),
                        key=lambda d: d[0]["price"])
         for o, reason in deals[:1]:
             # Цены у поездов меняются редко: тот же поезд по той же цене не повторяем,
             # пока запись хранится в sent (неделю).
-            sent_key = f"{key}|{o['train']}|{o['car']}|{o['price']}"
+            sent_key = f"{key}|{o.get('date', '')}|{o['train']}|{o['car']}|{o['price']}"
             if sent_key in sent:
                 continue
             tg.send(f"🚆 ГОША СРОЧНО ПОЕЗД {t['from_name']} → {t['to_name']} "
-                    f"{fmt_price(o['price'])} ₽\n{train_offer_line(o, link)}\nПочему: {reason}",
-                    alert_buttons(t))
+                    f"{fmt_price(o['price'])} ₽\n{train_offer_line(o)}\nПочему: {reason}",
+                    alert_buttons(t, o["link"]))
             sent[sent_key] = now.isoformat()
             alerts += 1
         add_history(history, key, offers, cfg, now)
@@ -419,62 +444,160 @@ def find_station(text):
     return [{"code": s[0], "name": s[1]} for s in found[:6]]
 
 
+TUTU_CARS = {"RESERVED_SEAT": "plazcard", "COMPARTMENT": "coupe", "SEDENTARY": "sedentary",
+             "LUX": "lux", "SOFT": "soft"}
+
+
+def train_link(frm, to, day=None):
+    link = f"{TUTU}/poezda/rasp_d.php?nnst1={frm}&nnst2={to}"
+    if day:
+        link += "&date=" + date.fromisoformat(day).strftime("%d.%m.%Y")
+    return link
+
+
+def train_key(t):
+    dates = "-".join(t["dates"]) if t.get("dates") else "any"
+    return f"T|{t['from']}-{t['to']}|{t.get('car', 'any')}|{dates}"
+
+
 def fetch_trains(frm, to):
-    """Все поезда между станциями: [{price, car, train, ...}], ссылка на Туту.ру."""
+    """Все поезда между станциями без даты (цены «от»): [{price, car, train, ...}]."""
     url = TRAINS_URL + "?" + urllib.parse.urlencode(
         {"service": "tutu_trains", "term": frm, "term2": to})
     data = http_get_json(url)
+    link = train_link(frm, to)
     offers = []
     for t in data.get("trips") or []:
         for c in t.get("categories") or []:
             if c.get("price"):
                 offers.append({"price": int(c["price"]), "car": c.get("type", ""),
                                "train": t.get("trainNumber", ""), "name": t.get("name", ""),
-                               "dep": t.get("departureStation", ""),
+                               "station": STATION_NAMES.get(t.get("departureStation"), ""),
                                "dep_time": (t.get("departureTime") or "")[:5],
-                               "seconds": int(t.get("travelTimeInSeconds") or 0)})
-    link = TUTU + (data.get("url") or f"/poezda/rasp_d.php?nnst1={frm}&nnst2={to}")
-    return offers, link
+                               "seconds": int(t.get("travelTimeInSeconds") or 0), "link": link})
+    return offers
+
+
+def fetch_train_day(frm, to, day):
+    """Поезда на дату day (YYYY-MM-DD) с точными ценами и свободными местами."""
+    body = {"routes": [{"departureStationCode": frm, "arrivalStationCode": to,
+                        "departureDate": day}],
+            "searchId": str(uuid.uuid4()), "source": "trainOffers"}
+    data = http_post_json(TUTU_OFFERS_URL, body, {"Origin": TUTU, "Referer": TUTU + "/"})
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    dic = data.get("dictionary") or {}
+    com, tr = dic.get("common") or {}, dic.get("train") or {}
+    fares, conditions = com.get("fareApplications") or {}, tr.get("conditions") or {}
+    offers = {}  # один поезд, вагон и цена — одна строка, места складываем
+    for off in ((data.get("offers") or {}).get("actual") or {}).values():
+        try:
+            seg = com["segments"][com["routes"][off["routeIds"][0]]["segmentIds"][0]]
+        except (KeyError, IndexError, TypeError):
+            continue
+        voyage = (tr.get("voyages") or {}).get(seg.get("voyageNumber")) or {}
+        vehicle = (tr.get("vehicles") or {}).get(seg.get("vehicleId")) or {}
+        point = (tr.get("points") or {}).get(str(seg.get("departureGeoPointId"))) or {}
+        dep = seg.get("departureDateTime") or ""
+        for var in off.get("offerVariants") or []:
+            if (var.get("status") or {}).get("saleStatus") != "ALLOWED":
+                continue
+            # priceOld — обычная цена; price бывает со скидкой только для карты Альфа-банка.
+            price = (var.get("priceOld") or var.get("price") or {}).get("value") or {}
+            if not price.get("amount"):
+                continue
+            fas = [fares.get(i) or {} for ids in (var.get("fareApplications") or {}).values()
+                   for i in ids]
+            cond = conditions.get(fas[0].get("segmentConditions")) or {} if fas else {}
+            o = {"price": round(price["amount"] / (price.get("fraction") or 100)),
+                 "car": TUTU_CARS.get(cond.get("carType"), ""),
+                 "train": voyage.get("numberForPassengers") or voyage.get("number", ""),
+                 "name": vehicle.get("name", ""),
+                 "station": (point.get("name") or {}).get("nominative", ""),
+                 "date": dep[:10] or day, "dep_time": dep[11:16],
+                 "seconds": int(seg.get("duration") or 0) * 60,
+                 "seats": sum(fa.get("seats", 0) for fa in fas),
+                 "link": train_link(frm, to, dep[:10] or day)}
+            same = (o["train"], o["date"], o["car"], o["price"])
+            if same in offers:
+                offers[same]["seats"] += o["seats"]
+            else:
+                offers[same] = o
+    return list(offers.values())
+
+
+def date_range(first, last):
+    d = date.fromisoformat(first)
+    while d.isoformat() <= last:
+        yield d.isoformat()
+        d += timedelta(days=1)
 
 
 def train_offers(item):
-    """Поезда по направлению с учётом типа вагона: (offers, ссылка)."""
-    try:
-        offers, link = fetch_trains(item["from"], item["to"])
-    except Exception as e:  # noqa: BLE001
-        print(f"trains error {item['from']}->{item['to']}: {e}", file=sys.stderr)
-        return [], None
+    """Поезда по направлению с учётом дат и типа вагона."""
+    offers = []
+    if item.get("dates"):
+        today = datetime.now(MSK).date().isoformat()
+        for i, day in enumerate(d for d in date_range(*item["dates"]) if d >= today):
+            if i:
+                time.sleep(1)  # не дёргаем Туту.ру слишком часто
+            try:
+                offers += fetch_train_day(item["from"], item["to"], day)
+            except Exception as e:  # noqa: BLE001
+                print(f"trains error {item['from']}->{item['to']} {day}: {e}", file=sys.stderr)
+    else:
+        try:
+            offers = fetch_trains(item["from"], item["to"])
+        except Exception as e:  # noqa: BLE001
+            print(f"trains error {item['from']}->{item['to']}: {e}", file=sys.stderr)
     car = item.get("car", "any")
     if car != "any":
         offers = [o for o in offers if o["car"] == car]
-    return offers, link
+    return offers
 
 
-def train_offer_line(o, link, note=True):
+def train_offer_line(o, note=True, link=True):
     hours, minutes = divmod(o["seconds"] // 60, 60)
     name = f" «{o['name']}»" if o["name"] else ""
-    station = STATION_NAMES.get(o["dep"], "")
-    return (f"{CAR_NAMES.get(o['car'], o['car']).capitalize()}, поезд {o['train']}{name}\n"
-            f"Отправление в {o['dep_time']}" + (f" ({station})" if station else "")
-            + f", в пути {hours} ч {minutes} мин\n"
-            + ("Это цена «от»: даты и места смотри на Туту.ру\n" if note else "") + (link or ""))
+    when = f"{o['date'][8:]}.{o['date'][5:7]} в {o['dep_time']}" if o.get("date") else f"в {o['dep_time']}"
+    lines = [f"{CAR_NAMES.get(o['car'], o['car']).capitalize()}, поезд {o['train']}{name}",
+             f"Отправление {when}" + (f" ({o['station']})" if o["station"] else "")
+             + f", в пути {hours} ч {minutes} мин"]
+    if o.get("seats"):
+        lines.append(f"Свободных мест: {o['seats']}")
+    if note and not o.get("date"):
+        lines.append("Это цена «от»: даты и места смотри на Туту.ру")
+    if link:
+        lines.append(o["link"])
+    return "\n".join(lines)
+
+
+def train_title(t):
+    title = f"{t['from_name']} → {t['to_name']}"
+    if t.get("dates"):
+        title += " " + train_dates_short(t)
+    if t.get("car", "any") != "any":
+        title += f", {CARS[t['car']]}"
+    return title
+
+
+def train_dates_short(t):
+    a, b = (f"{d[8:]}.{d[5:7]}" for d in t["dates"])
+    return a if a == b else f"{a}–{b}"
 
 
 def train_prices(settings):
-    lines = ["🚆 Поезда (цены «от» по данным Туту.ру):"]
+    lines = ["🚆 Поезда:"]
     trains = settings.get("trains", [])
     if not trains:
         return "Поездов пока нет, добавь их в меню 🏠 → 🚆 Поезда"
     for t in trains:
-        title = f"{t['from_name']} → {t['to_name']}"
-        if t.get("car", "any") != "any":
-            title += f", {CARS[t['car']]}"
-        offers, link = train_offers(t)
+        offers = train_offers(t)
         if not offers:
-            lines.append(f"{title}: поездов не нашёл")
+            lines.append(f"{train_title(t)}: билетов не нашёл")
             continue
         best = min(offers, key=lambda o: o["price"])
-        lines.append(f"{title}: {fmt_price(best['price'])} ₽\n{train_offer_line(best, link, False)}")
+        lines.append(f"{train_title(t)}: {fmt_price(best['price'])} ₽\n{train_offer_line(best)}")
     return "\n".join(lines)
 
 
@@ -750,9 +873,10 @@ def item_label(kind, item):
     pause = "⏸ " if item.get("paused") else ""
     last = f" · сейчас {k(item['last_price'])}" if item.get("last_price") else ""
     if kind == "train":
+        dates = " " + train_dates_short(item) if item.get("dates") else ""
         car = f" · {CARS[item['car']]}" if item.get("car", "any") != "any" else ""
         limit = f"до {k(item['max_price'])}" if item.get("max_price") else "падения"
-        return f"{pause}🚆 {item['from_name']} → {item['to_name']}{car} · {limit}{last}"
+        return f"{pause}🚆 {item['from_name']} → {item['to_name']}{dates}{car} · {limit}{last}"
     if kind == "route":
         limit = f"до {k(item['max_price'])}" if item.get("max_price") else "падения"
         return f"{pause}📍 {item['city']} · {limit}{last}"
@@ -807,7 +931,7 @@ def trains_screen(settings):
     lines = ["🚆 Поезда\n"]
     if trains:
         lines.append("Сообщу, когда билет станет дешевле порога или резко подешевеет.\n"
-                     "Цены «от» по данным Туту.ру, без конкретной даты.\n"
+                     "С датами — точные цены и места на эти дни, без дат — цены «от».\n"
                      "Нажми на направление, чтобы изменить его.")
     else:
         lines.append("Направлений пока нет. Добавь первое кнопкой ниже 👇")
@@ -844,18 +968,21 @@ def train_screen(item, note=""):
     i = item["id"]
     lines = [note] if note else []
     lines.append(f"🚆 {item['from_name']} → {item['to_name']}")
+    if item.get("dates"):
+        lines.append(f"Даты: {train_dates_short(item)} (точные цены и места по данным Туту.ру)")
+    else:
+        lines.append("Даты: любые (цены «от» по данным Туту.ру, без конкретной даты)")
     lines.append("Вагон: " + CARS[item.get("car", "any")])
     lines.append(f"Сообщу, когда билет дешевле {fmt_price(item['max_price'])} ₽ "
                  "или резко подешевеет." if item.get("max_price")
                  else "Сообщу, когда билет резко подешевеет.")
     if item.get("last_price"):
         lines.append(last_price_line(item))
-    lines.append("Цены «от» по данным Туту.ру: даты и места смотри по ссылке в «Цена сейчас».")
     lines.append("⏸ На паузе: не присылаю уведомления" if item.get("paused") else "✅ Слежу")
     buttons = [
         [("− 1к", f"ip:{i}:-1000"), ("− 500", f"ip:{i}:-500"),
          ("+ 500", f"ip:{i}:500"), ("+ 1к", f"ip:{i}:1000")],
-        [("✏️ Своя цена", f"it:{i}")],
+        [("✏️ Своя цена", f"it:{i}"), ("📅 Даты", f"id:{i}")],
         [("🛏 Вагон: " + CARS[item.get("car", "any")], f"iv:{i}"),
          ("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
         [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
@@ -977,6 +1104,39 @@ def pick_car_screen(wiz):
              [("Сидячий", "wv:sedentary"), ("СВ", "wv:lux")], wiz_cancel(wiz)])
 
 
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+TRAIN_DATES_HINT = ("Нажми на дату или напиши свою: 15.12 — один день, "
+                    "15.12-20.12 — несколько дней подряд (до 7).\n"
+                    "«Любая дата» — слежу за ценами «от» без конкретной даты.")
+
+
+def pick_train_dates_screen(title, prefix, cancel):
+    """Даты для поезда: ближайшие пятницы–воскресенья кнопками, свои даты текстом."""
+    days, d = [], datetime.now(MSK).date() + timedelta(days=1)
+    while len(days) < 6:
+        if d.weekday() >= 4:
+            days.append(d)
+        d += timedelta(days=1)
+    btns = [(f"{WEEKDAYS[d.weekday()]} {d:%d.%m}", f"{prefix}{d.isoformat()}") for d in days]
+    return (f"{title}: когда едем?\n\n{TRAIN_DATES_HINT}",
+            rows(btns, 3) + [[("📅 Любая дата", f"{prefix}any")], cancel])
+
+
+def parse_train_dates(text, today):
+    """«15.12», «15.12-20.12» → [первый, последний день]; «любая» → None; иначе строка-ошибка."""
+    if _norm(text) in ("любая", "любая дата", "любой день", "без даты", "любые"):
+        return None
+    f = parse_dates(text, today)
+    if isinstance(f, str):
+        return "Не понял дату. Напиши, например, 15.12 или 15.12-20.12."
+    if len(f["depart"]) != 10:
+        return "Для поезда напиши конкретные дни, например 15.12 или 15.12-20.12."
+    first, last = f["depart"], f.get("return") or f["depart"]
+    if (date.fromisoformat(last) - date.fromisoformat(first)).days > 6:
+        return "Можно выбрать до 7 дней подряд, например 15.12-21.12."
+    return [first, last]
+
+
 def pick_origin_screen():
     btns = [(name, f"po:{code}") for code, name in POPULAR_ORIGINS]
     return ("Откуда будешь улетать? Нажми на город или напиши свой.",
@@ -993,7 +1153,7 @@ def back_button(settings, code):
 
 def wizard_current_price(token, cfg, settings, wiz):
     if wiz["kind"] == "t":
-        offers, _ = train_offers(wiz)
+        offers = train_offers(wiz)
         return min((o["price"] for o in offers), default=None)
     try:
         if wiz["kind"] == "r":
@@ -1060,15 +1220,19 @@ def train_wizard_next(state, settings, tg, token, cfg, show):
         return show(*pick_station_screen(wiz))
     if "car" not in wiz:
         return show(*pick_car_screen(wiz))
+    if "dates" not in wiz:
+        state["awaiting"] = {"type": "wiz_tdates"}
+        return show(*pick_train_dates_screen(f"🚆 {wiz['city']}", "wd:", wiz_cancel(wiz)))
     if "price" not in wiz:
         state["awaiting"] = {"type": "wiz_price"}
         return show(*pick_price_screen(wiz, wizard_current_price(token, cfg, settings, wiz)))
 
     item = {"id": uuid.uuid4().hex[:8], "from": wiz["from"], "from_name": wiz["from_name"],
             "to": wiz["to"], "to_name": wiz["to_name"], "city": wiz["city"],
-            "car": wiz["car"], "max_price": wiz["price"] or None}
+            "car": wiz["car"], "dates": wiz["dates"], "max_price": wiz["price"] or None}
+    same = ("from", "to", "car", "dates")
     settings["trains"] = [t for t in settings["trains"]
-                          if (t["from"], t["to"], t.get("car")) != (item["from"], item["to"], item["car"])]
+                          if [t.get(f) for f in same] != [item[f] for f in same]]
     settings["trains"].append(item)
     state.pop("wiz", None)
     state.pop("awaiting", None)
@@ -1135,6 +1299,15 @@ def handle(text, state, settings, tg, token, cfg):
             wizard_set_station(wiz, station)
             wizard_next(state, settings, tg, token, cfg)
         return False
+    if kind == "wiz_tdates" and wiz:
+        dates = parse_train_dates(text, date.today())
+        if isinstance(dates, str):
+            state["awaiting"] = awaiting
+            tg.send(dates)
+            return False
+        wiz["dates"] = dates
+        wizard_next(state, settings, tg, token, cfg)
+        return False
     if kind == "wiz_dates" and wiz:
         fields = parse_dates(text, date.today())
         if isinstance(fields, str):
@@ -1156,11 +1329,19 @@ def handle(text, state, settings, tg, token, cfg):
         wizard_next(state, settings, tg, token, cfg)
         return state.pop("changed", False)
     if kind in ("item_price", "item_dates"):
-        _, item = find_item(settings, awaiting.get("id"))
+        item_kind, item = find_item(settings, awaiting.get("id"))
         if not item:
             tg.send(*home_screen(settings))
             return False
-        if kind == "item_price":
+        if kind == "item_dates" and item_kind == "train":
+            dates = parse_train_dates(text, date.today())
+            if isinstance(dates, str):
+                state["awaiting"] = awaiting
+                tg.send(dates)
+                return False
+            item["dates"] = dates
+            item.pop("last_price", None)
+        elif kind == "item_price":
             amount = parse_amount(text)
             if not amount:
                 state["awaiting"] = awaiting
@@ -1245,6 +1426,9 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     elif cmd == "wv" and state.get("wiz", {}).get("kind") == "t":
         state["wiz"]["car"] = arg
         wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wd" and state.get("wiz", {}).get("kind") == "t":
+        state["wiz"]["dates"] = None if arg == "any" else [arg, arg]
+        wizard_next(state, settings, tg, token, cfg, message_id)
     elif cmd == "wc" and state.get("wiz"):
         code, name, country = next(d for d in POPULAR_DESTINATIONS if d[0] == arg)
         wizard_set_city(state, settings, {"code": code, "name": name, "country": country})
@@ -1263,7 +1447,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
 
     # Карточка направления
-    elif cmd in ("i", "ip", "it", "id", "ir", "ic", "iv", "iz", "in", "iq", "ix"):
+    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "iv", "iz", "in", "iq", "ix"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -1283,6 +1467,15 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             tg.send(f"{item['city']}: напиши новую цену, например {example}.",
                     [[("⬅️ Отмена", f"i:{item_id}")]])
             return False
+        elif cmd == "id" and kind == "train":
+            state["awaiting"] = {"type": "item_dates", "id": item_id}
+            edit(*pick_train_dates_screen(f"🚆 {item['city']}", f"ia:{item_id}:",
+                                          [("⬅️ Отмена", f"i:{item_id}")]))
+            return False
+        elif cmd == "ia":
+            item["dates"] = None if extra == "any" else [extra, extra]
+            item.pop("last_price", None)
+            note = "✅ Даты: " + (train_dates_short(item) if item["dates"] else "любые") + "\n"
         elif cmd == "id":
             state["awaiting"] = {"type": "item_dates", "id": item_id}
             tg.send(f"🎯 {item['city']}: напиши новые даты, например 15.12-25.12, 20.11 или декабрь.",
@@ -1295,23 +1488,30 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         elif cmd == "iv":
             cars = list(CARS)
             item["car"] = cars[(cars.index(item.get("car", "any")) + 1) % len(cars)]
+            item.pop("last_price", None)
             note = f"✅ Вагон: {CARS[item['car']]}\n"
         elif cmd == "iz":
             item["paused"] = not item.get("paused")
             note = "⏸ Поставил на паузу.\n" if item["paused"] else "▶️ Снова слежу.\n"
         elif cmd == "in" and kind == "train":
             tg.send("🔎 Ищу цены…")
-            offers, link = train_offers(item)
+            offers = train_offers(item)
             remember_price(item, offers, datetime.now(timezone.utc))
             back = [[("⬅️ К направлению", f"i:{item_id}")]]
             if not offers:
-                tg.send(f"{item['city']}: поездов не нашёл 😔", back)
+                tg.send(f"{train_title(item)}: билетов не нашёл 😔", back)
                 return False
-            best = sorted(offers, key=lambda o: o["price"])[:3]
-            tg.send(f"💰 {item['city']}: от {fmt_price(best[0]['price'])} ₽\n\n"
-                    + "\n\n".join(f"{fmt_price(o['price'])} ₽ · " + train_offer_line(o, None, False).strip()
-                                  for o in best)
-                    + f"\n\nЦены «от»: даты и места смотри на Туту.ру\n{link}", back)
+            best = []  # три самых дешёвых разных поезда
+            for o in sorted(offers, key=lambda o: o["price"]):
+                if all((o["train"], o.get("date")) != (b["train"], b.get("date")) for b in best):
+                    best.append(o)
+            best = best[:3]
+            note = ("" if item.get("dates")
+                    else "\n\nЭто цены «от»: даты и места смотри на Туту.ру")
+            tg.send(f"💰 {train_title(item)}: от {fmt_price(best[0]['price'])} ₽\n\n"
+                    + "\n\n".join(f"{fmt_price(o['price'])} ₽ · " + train_offer_line(o, False, False)
+                                  for o in best) + note,
+                    [[("🎫 Купить билет", best[0]["link"])]] + back)
             return False
         elif cmd == "in":
             tg.send("🔎 Ищу цены…")
@@ -1322,7 +1522,8 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                 best = min(offers, key=lambda o: o["price"])
                 tg.send(f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n"
                         f"{offer_line(best, item['origin_name'], item)}",
-                        [[("⬅️ К направлению", f"i:{item_id}")]])
+                        [[("🎫 Купить билет", offer_link(best))],
+                         [("⬅️ К направлению", f"i:{item_id}")]])
             else:
                 tg.send(f"{item['city']}: билетов не нашёл 😔", [[("⬅️ К направлению", f"i:{item_id}")]])
             return False
@@ -1336,7 +1537,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                    else origin_screen(settings, item["origin"])))
             return False
         edit(*item_screen(settings, item_id, note))
-        return cmd in ("ip", "ir", "ic", "iv")
+        return cmd in ("ip", "ir", "ic", "iv", "ia")
 
     # Цены
     elif cmd in ("p", "pa"):
