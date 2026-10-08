@@ -286,6 +286,23 @@ def transfer_cities(o):
     return cities, len(middle) > o.get("transfers", 0)
 
 
+def baggage(o):
+    """Багаж по тарифу из ссылки Aviasales (static_fare_key=…|L1_1_23|…); None — неизвестно."""
+    m = re.search(r"static_fare_key=([^&]+)", o.get("link", ""))
+    if not m:
+        return None
+    for part in urllib.parse.unquote(m.group(1)).split("|"):
+        if part == "L0":
+            return "🧳 Без багажа: чемодан за доплату"
+        if part.startswith("L1"):
+            nums = part.split("_")[1:]
+            if len(nums) == 2 and nums[1] != "0":
+                pieces, kg = nums
+                return f"🧳 Багаж включён: {kg} кг" + (f" ({pieces} места)" if pieces != "1" else "")
+            return "🧳 Багаж включён"
+    return None
+
+
 def trip_details(o):
     """«✈️ Аэрофлот · прямой · в пути 9 ч 30 мин» + пометка про багаж у лоукостеров."""
     code = o.get("airline", "")
@@ -307,7 +324,10 @@ def trip_details(o):
         if travel_minutes(o):
             parts.append(f"в пути {fmt_minutes(travel_minutes(o))}")
     line = " · ".join(parts)
-    if code in LOWCOST:
+    bag = baggage(o)
+    if bag:
+        line += "\n" + bag
+    elif code in LOWCOST:
         line += "\n🧳 Лоукостер: багаж, скорее всего, за доплату"
     return line
 
