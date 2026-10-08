@@ -200,6 +200,8 @@ AIRLINES = {
     "VN": "Vietnam Airlines", "VJ": "VietJet", "FD": "Thai AirAsia", "AK": "AirAsia",
     "J9": "Jazeera Airways", "XY": "flynas", "OV": "SalamAir", "6E": "IndiGo", "UL": "SriLankan",
     "AI": "Air India", "MS": "EgyptAir", "B2": "Belavia", "XQ": "SunExpress", "IR": "Iran Air",
+    "JD": "Capital Airlines", "3U": "Sichuan Airlines", "ZH": "Shenzhen Airlines",
+    "SC": "Shandong Airlines", "MF": "Xiamen Airlines", "GS": "Tianjin Airlines",
 }
 # Лоукостеры: в самый дешёвый тариф багаж обычно не входит.
 LOWCOST = {"DP", "G9", "3L", "PC", "VF", "FZ", "XY", "J9", "OV", "VJ", "FD", "AK", "D7", "TR",
@@ -222,8 +224,11 @@ AIRPORT_CITIES = {
     "BKK": "Бангкок", "DMK": "Бангкок", "HKT": "Пхукет", "SGN": "Хошимин", "HAN": "Ханой",
     "DAD": "Дананг", "CXR": "Нячанг", "KUL": "Куала-Лумпур", "SIN": "Сингапур",
     "DPS": "Бали", "CGK": "Джакарта", "MNL": "Манила", "ICN": "Сеул", "NRT": "Токио",
+    "HGH": "Ханчжоу", "TAO": "Циндао", "XMN": "Сямэнь", "TSN": "Тяньцзинь", "CKG": "Чунцин",
+    "SYX": "Санья", "ZIA": "Москва", "KUT": "Кутаиси", "GOI": "Гоа", "GOX": "Гоа",
 }
 AUTO_EXTRA_MIN = 600  # «авто»: не дольше самого быстрого варианта + 10 часов на каждую сторону
+AUTO_MAX_MIN = 30 * 60  # и не дольше 30 часов на сторону, если есть варианты быстрее
 HOURS_STEPS = [None, 12, 16, 20, 24, 30, 0]  # None — авто, 0 — любое время в пути
 
 
@@ -237,7 +242,11 @@ def comfort(offers, max_hours, legs=1):
     timed = [travel_minutes(o) for o in offers if travel_minutes(o)]
     if max_hours == 0 or not timed:
         return offers
-    limit = max_hours * 60 * legs if max_hours else min(timed) + AUTO_EXTRA_MIN * legs
+    if max_hours:
+        limit = max_hours * 60 * legs
+    else:
+        fastest = min(timed)
+        limit = max(fastest, min(fastest + AUTO_EXTRA_MIN * legs, AUTO_MAX_MIN * legs))
     return [o for o in offers if not travel_minutes(o) or travel_minutes(o) <= limit]
 
 
@@ -247,7 +256,8 @@ def hours_label(max_hours):
 
 def hours_text(max_hours):
     if max_hours is None:
-        return "авто — отсеиваю билеты, где лететь на 10+ часов дольше самого быстрого"
+        return ("авто — отсеиваю билеты, где лететь на 10+ часов дольше самого быстрого "
+                "или больше 30 ч")
     if max_hours == 0:
         return "любое — показываю все пересадки"
     return f"не дольше {max_hours} ч в одну сторону"
@@ -259,12 +269,38 @@ def fmt_minutes(m):
 
 
 def transfer_cities(o):
-    """Города пересадок «туда»: аэропорты зашиты в ссылку Aviasales (…SVOCANHKT_…)."""
+    """(города пересадок, меняется ли аэропорт) для билета в одну сторону.
+
+    Аэропорты зашиты в ссылку Aviasales: …SVOCANHKT_… Если прилетаешь в один аэропорт,
+    а улетаешь из другого (…VKODWCDXBCMB_…), аэропортов больше, чем пересадок.
+    """
     m = re.search(r"[?&]t=[A-Z0-9]{2}\d+([A-Z]{6,})_", o.get("link", ""))
     if not m:
-        return []
-    codes = [m.group(1)[i:i + 3] for i in range(0, len(m.group(1)) - 2, 3)]
-    return [AIRPORT_CITIES.get(c, c) for c in codes[1:1 + o.get("transfers", 0)]]
+        return [], False
+    middle = [m.group(1)[i:i + 3] for i in range(3, len(m.group(1)) - 3, 3)]
+    cities = []
+    for c in middle:
+        city = AIRPORT_CITIES.get(c, c)
+        if not cities or cities[-1] != city:
+            cities.append(city)
+    return cities, len(middle) > o.get("transfers", 0)
+
+
+def baggage(o):
+    """Багаж по тарифу из ссылки Aviasales (static_fare_key=…|L1_1_23|…); None — неизвестно."""
+    m = re.search(r"static_fare_key=([^&]+)", o.get("link", ""))
+    if not m:
+        return None
+    for part in urllib.parse.unquote(m.group(1)).split("|"):
+        if part == "L0":
+            return "🧳 Без багажа: чемодан за доплату"
+        if part.startswith("L1"):
+            nums = part.split("_")[1:]
+            if len(nums) == 2 and nums[1] != "0":
+                pieces, kg = nums
+                return f"🧳 Багаж включён: {kg} кг" + (f" ({pieces} места)" if pieces != "1" else "")
+            return "🧳 Багаж включён"
+    return None
 
 
 def trip_details(o):
@@ -281,12 +317,17 @@ def trip_details(o):
         if transfers == 0:
             parts.append("прямой")
         else:
-            where = ", ".join(transfer_cities(o))
-            parts.append(f"пересадок: {transfers}" + (f" ({where})" if where else ""))
+            cities, change = transfer_cities(o)
+            where = ", ".join(cities)
+            parts.append(f"пересадок: {transfers}" + (f" ({where})" if where else "")
+                         + (", ⚠️ смена аэропорта" if change else ""))
         if travel_minutes(o):
             parts.append(f"в пути {fmt_minutes(travel_minutes(o))}")
     line = " · ".join(parts)
-    if code in LOWCOST:
+    bag = baggage(o)
+    if bag:
+        line += "\n" + bag
+    elif code in LOWCOST:
         line += "\n🧳 Лоукостер: багаж, скорее всего, за доплату"
     return line
 
@@ -355,16 +396,163 @@ def offer_line(offer, origin_name, route):
             f"{trip_details(offer)}\n{offer_link(offer)}")
 
 
-def format_alert(route, offer, reason, origin_name):
+# ---------- Обратный билет ----------
+
+RETURN_DAYS = (5, 30)  # по умолчанию обратный рейс ищем через 5–30 дней после вылета
+BACK_PRESETS = [("Неделя", 6, 8), ("10 дней", 9, 11), ("2 недели", 13, 15),
+                ("3 недели", 20, 22), ("Месяц", 28, 32), ("Любой срок", 5, 30)]
+
+
+def back_window(item, dep):
+    """Когда лететь обратно: (первый день, последний день) для вылета dep."""
+    back = item.get("back") or {}
+    if back.get("dates"):
+        first, last = (date.fromisoformat(d) for d in back["dates"])
+        return max(first, dep + timedelta(days=1)), last
+    lo, hi = back.get("days") or RETURN_DAYS
+    return dep + timedelta(days=lo), dep + timedelta(days=hi)
+
+
+def back_text(item):
+    """«через 5–30 дней», «через 2 недели», «25.12», «20.12–28.12»."""
+    back = item.get("back") or {}
+    if back.get("dates"):
+        first, last = back["dates"]
+        short = lambda d: f"{d[8:]}.{d[5:7]}"  # noqa: E731
+        return short(first) if first == last else f"{short(first)}–{short(last)}"
+    lo, hi = back.get("days") or RETURN_DAYS
+    for label, plo, phi in BACK_PRESETS[:-1]:
+        if (lo, hi) == (plo, phi):
+            return "через " + {"Неделя": "неделю", "Месяц": "месяц"}.get(label, label)
+    if hi - lo == 2:
+        return f"примерно через {days_word(lo + 1)}"
+    return f"через {days_word(lo)}" if lo == hi else f"через {lo}–{hi} дней"
+
+
+def days_word(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} дня"
+    return f"{n} дней"
+
+
+def window_queries(lo, hi):
+    """Даты или месяцы для запроса к API, покрывающие окно [lo, hi]."""
+    if lo == hi:
+        return [lo.isoformat()]
+    out, d = [], lo.replace(day=1)
+    while d <= hi:
+        out.append(d.strftime("%Y-%m"))
+        d = (d + timedelta(days=32)).replace(day=1)
+    return out
+
+
+def return_info(token, origin, destination, offer, item):
+    """Сколько стоит вернуться: (туда-обратно одним билетом, обратный билет отдельно)."""
+    try:
+        dep = date.fromisoformat(offer["departure_at"][:10])
+        lo, hi = back_window(item, dep)
+        if hi < lo:
+            return None, None
+        inside = lambda d: lo.isoformat() <= d[:10] <= hi.isoformat()  # noqa: E731
+        rt, back = [], []
+        for q in window_queries(lo, hi):
+            rt += fetch_cheapest(token, origin, destination, dep.isoformat(), q, one_way=False)
+            back += fetch_cheapest(token, destination, origin, q)
+        rt = comfort([o for o in rt if inside(o.get("return_at", ""))], item.get("max_hours"), 2)
+        back = comfort([o for o in back if inside(o["departure_at"])], item.get("max_hours"))
+    except Exception as e:  # noqa: BLE001
+        print(f"return_info {origin}-{destination}: {e!r}", file=sys.stderr)
+        return None, None
+    cheapest = lambda offers: min(offers, key=lambda o: o["price"]) if offers else None  # noqa: E731
+    return cheapest(rt), cheapest(back)
+
+
+def parse_back(text, today):
+    """«12», «10-14», «2 недели», «25.12», «20.12-28.12», «декабрь» → поле back или строка-ошибка."""
+    low = _norm(text)
+    words = {"неделя": (6, 8), "неделю": (6, 8), "1 неделя": (6, 8), "10 дней": (9, 11),
+             "2 недели": (13, 15), "две недели": (13, 15), "3 недели": (20, 22),
+             "три недели": (20, 22), "месяц": (28, 32), "любой": (5, 30), "любой срок": (5, 30)}
+    low = re.sub(r"^через ", "", low)
+    if low in words:
+        return {"days": list(words[low])}
+    m = None if re.search(r"\d\.\d", text) else re.fullmatch(r"(\d{1,2})(?: (\d{1,2}))?(?: дн\w*| день)?", low)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else None
+        lo, hi = (min(a, b), max(a, b)) if b else (max(1, a - 1), a + 1)
+        if hi > 60:
+            return "Можно не больше 60 дней. Например: 14 или 10-14."
+        return {"days": [lo, hi]}
+    fields = parse_dates(text, today)
+    if isinstance(fields, str):
+        return ("Не понял. Напиши, через сколько дней обратно (14 или 10-14) "
+                "или дату (25.12 или 20.12-28.12).")
+    first = fields["depart"]
+    last = fields.get("return") or first
+    if len(first) == 7:
+        first = first + "-01"
+    if len(last) == 7:
+        y, mth = int(last[:4]), int(last[5:])
+        last = ((date(y, mth, 28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).isoformat()
+    return {"dates": [first, last]}
+
+
+def pick_back_screen(item):
+    i = item["id"]
+    text = (f"↩️ {item['city']}: когда летим обратно?\n\nСейчас: {back_text(item)}.\n\n"
+            "Выбери срок или напиши:\n"
+            "• 12 — через 12 дней\n"
+            "• 10-14 — через 10–14 дней\n"
+            "• 25.12 — точная дата\n"
+            "• 20.12-28.12 — любой день в эти даты")
+    btns = [(label, f"iy:{i}:{lo}-{hi}") for label, lo, hi in BACK_PRESETS]
+    return text, rows(btns, 3) + [[("⬅️ Отмена", f"i:{i}")]]
+
+
+def brief(o):
+    """«China Southern, пересадок: 1, 18 ч 40 мин» — коротко про рейс."""
+    code = o.get("airline", "")
+    stops = o.get("transfers", 0) + o.get("return_transfers", 0)
+    parts = [AIRLINES.get(code, code)] if code else []
+    if stops:
+        parts.append(f"пересадок: {stops}")
+    else:
+        parts.append("прямые" if o.get("return_at") else "прямой")
+    if travel_minutes(o):
+        parts.append(("всего " if o.get("return_at") else "") + fmt_minutes(travel_minutes(o)))
+    return ", ".join(parts)
+
+
+def return_text(offer, rt, back, item=None):
+    """Строки про обратный путь под билетом «туда»."""
+    lines = []
+    if rt:
+        lines.append(f"🔁 Туда-обратно одним билетом: {fmt_price(rt['price'])} ₽, "
+                     f"обратно {short_date(rt['return_at'])} ({brief(rt)})")
+    if back:
+        lines.append(f"↩️ Обратно отдельно: {fmt_price(back['price'])} ₽, {short_date(back['departure_at'])} "
+                     f"({brief(back)}), вместе с «туда» {fmt_price(offer['price'] + back['price'])} ₽")
+    if not lines:
+        lines.append("↩️ Обратных билетов" + (f" ({back_text(item)})" if item else "") + " не нашёл")
+    return "\n".join(lines)
+
+
+def format_alert(route, offer, reason, origin_name, extra=""):
     return (
         f"🔥 ГОША СРОЧНО {route['name']} {fmt_price(offer['price'])} ₽\n"
         f"{offer_line(offer, origin_name, route)}\n"
-        f"Почему: {reason}"
+        + (f"{extra}\n" if extra else "")
+        + f"Почему: {reason}"
     )
 
 
-def alert_buttons(item, link=None):
+def alert_buttons(item, link=None, rt=None):
     buy = [[("🎫 Купить билет", link)]] if link else []
+    if rt:
+        buy.append([("🔁 Купить туда-обратно", offer_link(rt))])
     return buy + [[("⚙️ Настроить", f"i:{item['id']}"), ("⏸ Пауза", f"iz:{item['id']}")]]
 
 
@@ -395,8 +583,9 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             last = sent.get(sent_key)
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
-            tg.send(format_alert(route, o, reason, route["origin_name"]),
-                    alert_buttons(route, offer_link(o)))
+            rt, back = return_info(token, origin, route["destination"], o, route)
+            tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route)),
+                    alert_buttons(route, offer_link(o), rt))
             sent[sent_key] = now.isoformat()
             alerts += 1
 
@@ -422,9 +611,13 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
             continue
         kind = " туда-обратно" if f.get("round_trip") else ""
+        rt = extra = None
+        if not f.get("round_trip"):
+            rt, back = return_info(token, origin, f["destination"], o, f)
+            extra = return_text(o, rt, back, f)
         tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
-                f"{offer_line(o, f['origin_name'], f)}\n"
-                f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o)))
+                f"{offer_line(o, f['origin_name'], f)}\n" + (f"{extra}\n" if extra else "")
+                + f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o), rt))
         sent[sent_key] = now.isoformat()
         alerts += 1
     alerts += check_trains(tg, cfg, settings, history, sent, now)
@@ -520,8 +713,12 @@ def prices_now(token, cfg, settings, origin=None):
                 lines.append(f"{title}: билетов не нашёл" + (f"\n{note}" if note else ""))
                 continue
             best = min(offers, key=lambda o: o["price"])
+            back_line = ""
+            if not item.get("round_trip"):
+                rt, back = return_info(token, item["origin"], item["destination"], best, item)
+                back_line = "\n" + return_text(best, rt, back, item)
             lines.append(f"{title}: {fmt_price(best['price'])} ₽\n"
-                         f"{offer_line(best, origin_name, item)}" + (f"\n{note}" if note else ""))
+                         f"{offer_line(best, origin_name, item)}{back_line}" + (f"\n{note}" if note else ""))
     if trains:
         lines.append("\n" + train_prices(settings))
     return "\n".join(lines)
@@ -1144,6 +1341,8 @@ def item_screen(settings, item_id, note=""):
         lines.append(last_price_line(item))
     lines.append("Только прямые рейсы ✈️" if item.get("direct") else "С пересадками тоже")
     lines.append("⏱ Время в пути: " + hours_text(item.get("max_hours")))
+    if not item.get("round_trip"):
+        lines.append("↩️ Обратно: " + back_text(item) + " (покажу цену туда-обратно)")
     lines.append("⏸ На паузе: не присылаю уведомления" if item.get("paused") else "✅ Слежу")
 
     buttons = [
@@ -1160,7 +1359,8 @@ def item_screen(settings, item_id, note=""):
     buttons += [
         [("✈️ Только прямые: " + ("вкл" if item.get("direct") else "выкл"), f"ic:{i}"),
          ("⏱ В пути: " + hours_label(item.get("max_hours")), f"ih:{i}")],
-        [("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
+        ([] if item.get("round_trip") else [("↩️ Когда обратно", f"ib:{i}")])
+        + [("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
         [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
         [(f"⬅️ {item['origin_name']}", f"o:{item['origin']}")],
     ]
@@ -1460,6 +1660,19 @@ def handle(text, state, settings, tg, token, cfg):
         wiz["price"] = amount
         wizard_next(state, settings, tg, token, cfg)
         return state.pop("changed", False)
+    if kind == "item_back":
+        item_kind, item = find_item(settings, awaiting.get("id"))
+        if not item:
+            tg.send(*home_screen(settings))
+            return False
+        back = parse_back(text, date.today())
+        if isinstance(back, str):
+            state["awaiting"] = awaiting
+            tg.send(back)
+            return False
+        item["back"] = back
+        tg.send(*item_screen(settings, item["id"], "✅ Обратно: " + back_text(item) + "\n"))
+        return False
     if kind in ("item_price", "item_dates"):
         item_kind, item = find_item(settings, awaiting.get("id"))
         if not item:
@@ -1579,7 +1792,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
 
     # Карточка направления
-    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "iv", "iz", "in", "iq", "ix"):
+    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "ib", "iy", "iv", "iz", "in", "iq", "ix"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -1617,6 +1830,14 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             item["round_trip"] = not item.get("round_trip")
         elif cmd == "ic":
             item["direct"] = not item.get("direct")
+        elif cmd == "ib":
+            state["awaiting"] = {"type": "item_back", "id": item_id}
+            edit(*pick_back_screen(item))
+            return False
+        elif cmd == "iy":
+            lo, _, hi = extra.partition("-")
+            item["back"] = {"days": [int(lo), int(hi)]}
+            note = "✅ Обратно: " + back_text(item) + "\n"
         elif cmd == "ih":
             steps = HOURS_STEPS
             current = item.get("max_hours")
@@ -1665,6 +1886,11 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             best = min(offers, key=lambda o: o["price"])
             text = f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n{offer_line(best, item['origin_name'], item)}"
             buttons = [[("🎫 Купить билет", offer_link(best))]]
+            if not item.get("round_trip"):
+                rt, ret = return_info(token, item["origin"], item["destination"], best, item)
+                text += "\n" + return_text(best, rt, ret, item)
+                if rt:
+                    buttons.append([("🔁 Купить туда-обратно", offer_link(rt))])
             # Самый быстрый вариант, если он заметно быстрее самого дешёвого.
             fast = min(offers, key=lambda o: (travel_minutes(o) or 10 ** 6, o["price"]))
             if fast is not best and travel_minutes(fast) and travel_minutes(best) - travel_minutes(fast) >= 120:
