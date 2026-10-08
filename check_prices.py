@@ -189,9 +189,9 @@ def format_alert(route, offer, reason, origin_name):
 
 
 def check_prices(tg, token, cfg, settings, history, sent, now):
-    origin = settings["origin"]
     alerts = 0
     for route in settings["routes"]:
+        origin = route["origin"]
         key = f"{origin}-{route['destination']}"
         offers = route_offers(token, origin, route, cfg)
         if not offers:
@@ -206,7 +206,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             last = sent.get(sent_key)
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
-            tg.send(format_alert(route, o, reason, settings["origin_name"]))
+            tg.send(format_alert(route, o, reason, route["origin_name"]))
             sent[sent_key] = now.isoformat()
             alerts += 1
 
@@ -221,6 +221,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             settings["filters"].remove(f)
             tg.send(f"⌛ Даты прошли, убрал подбор: {filter_text(f)}")
             continue
+        origin = f["origin"]
         offers = [o for o in filter_offers(token, origin, f) if o["price"] <= f["max_price"]]
         if not offers:
             continue
@@ -231,51 +232,77 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             continue
         kind = " туда-обратно" if f.get("round_trip") else ""
         tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
-                f"{offer_line(o, settings['origin_name'], f)}\n"
+                f"{offer_line(o, f['origin_name'], f)}\n"
                 f"Подбор: {filter_text(f)}")
         sent[sent_key] = now.isoformat()
         alerts += 1
     print(f"Отправлено алертов: {alerts}")
 
 
+def ensure_origins(settings):
+    """Старые настройки: направления без своего города вылета получают общий."""
+    for item in settings["routes"] + settings.setdefault("filters", []):
+        item.setdefault("origin", settings["origin"])
+        item.setdefault("origin_name", settings["origin_name"])
+
+
+def grouped_items(settings):
+    """[(origin_name, [(kind, item), ...]), ...] — по городам вылета, текущий первым.
+
+    Порядок общий для списка и для удаления по номеру.
+    """
+    groups = {}
+    order = [settings["origin"]]
+    for kind, items in (("route", settings["routes"]), ("filter", settings.get("filters", []))):
+        for item in items:
+            if item["origin"] not in order:
+                order.append(item["origin"])
+            groups.setdefault(item["origin"], (item["origin_name"], []))[1].append((kind, item))
+    return [groups[o] for o in order if o in groups]
+
+
+def numbered_items(settings):
+    return [pair for _, pairs in grouped_items(settings) for pair in pairs]
+
+
 def prices_now(token, cfg, settings):
-    lines = [f"💰 Самые дешёвые билеты из {settings['origin_name']} на {cfg['months_ahead']} мес.:"]
-    for route in settings["routes"]:
-        offers = route_offers(token, settings["origin"], route, cfg)
-        if not offers:
-            lines.append(f"\n{route['name']}: билетов не нашёл")
-            continue
-        best = min(offers, key=lambda o: o["price"])
-        lines.append(f"\n{route['name']}: {fmt_price(best['price'])} ₽\n"
-                     f"{offer_line(best, settings['origin_name'], route)}")
-    for f in settings.get("filters", []):
-        offers = filter_offers(token, settings["origin"], f)
-        if not offers:
-            lines.append(f"\n🎯 {filter_text(f)}: билетов не нашёл")
-            continue
-        best = min(offers, key=lambda o: o["price"])
-        lines.append(f"\n🎯 {filter_text(f)}: {fmt_price(best['price'])} ₽\n"
-                     f"{offer_line(best, settings['origin_name'], f)}")
+    lines = [f"💰 Самые дешёвые билеты на {cfg['months_ahead']} мес.:"]
+    for origin_name, pairs in grouped_items(settings):
+        lines.append(f"\n🛫 Вылет: {origin_name}")
+        for kind, item in pairs:
+            if kind == "route":
+                offers, title = route_offers(token, item["origin"], item, cfg), item["name"]
+            else:
+                offers, title = filter_offers(token, item["origin"], item), "🎯 " + filter_text(item)
+            if not offers:
+                lines.append(f"{title}: билетов не нашёл")
+                continue
+            best = min(offers, key=lambda o: o["price"])
+            lines.append(f"{title}: {fmt_price(best['price'])} ₽\n"
+                         f"{offer_line(best, origin_name, item)}")
     return "\n".join(lines)
 
 
 # ---------- Команды ----------
 
 def routes_text(settings):
-    filters = settings.get("filters", [])
-    if not settings["routes"] and not filters:
-        return "Направлений пока нет. Нажми «➕ Добавить направление»."
-    lines = [f"Вылет из: {settings['origin_name']}"]
-    if settings["routes"]:
-        lines.append("Направления:")
-    for i, r in enumerate(settings["routes"], 1):
-        limit = f"до {fmt_price(r['max_price'])} ₽" if r.get("max_price") else "только резкие падения"
-        lines.append(f"{i}. {r['name']}, {limit}")
-    if filters:
-        lines.append("Подбор по датам:")
-    for i, f in enumerate(filters, len(settings["routes"]) + 1):
-        lines.append(f"{i}. 🎯 {filter_text(f)}")
-    return "\n".join(lines)
+    groups = grouped_items(settings)
+    if not groups:
+        return (f"Вылет из: {settings['origin_name']}\n"
+                "Направлений пока нет. Нажми «➕ Добавить направление».")
+    lines, i = [], 0
+    for origin_name, pairs in groups:
+        lines.append(f"\n🛫 Вылет: {origin_name}")
+        for kind, item in pairs:
+            i += 1
+            if kind == "route":
+                limit = (f"до {fmt_price(item['max_price'])} ₽" if item.get("max_price")
+                         else "только резкие падения")
+                lines.append(f"{i}. {item['name']}, {limit}")
+            else:
+                lines.append(f"{i}. 🎯 {filter_text(item)}")
+    lines.append(f"\nГород вылета для новых направлений: {settings['origin_name']}.")
+    return "\n".join(lines).strip()
 
 
 # ---------- Подбор по датам ----------
@@ -374,18 +401,36 @@ def filter_expired(f, today):
     return d < today.isoformat()
 
 
-def add_filter(settings, text):
-    city, f = parse_filter(text, date.today())
-    if city is None:
-        return f, False
-    place = find_place(city)
-    if isinstance(place, str):
-        return place, False
+def place_name(place):
     country = place["country"].upper()
-    f.update(name=f"{country} ({place['name']})" if country else place["name"].upper(),
-             city=place["name"], destination=place["code"])
-    settings.setdefault("filters", []).append(f)
-    return f"✅ Добавил подбор: {filter_text(f)}\nСообщу, как только найду такой билет.", True
+    return f"{country} ({place['name']})" if country else place["name"].upper()
+
+
+def split_items(text):
+    """Несколько городов через запятую, «;», «и» или с новой строки."""
+    parts = re.split(r"[,;\n]+|\s+и\s+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def add_filter(settings, text):
+    # Один набор дат и цены на все города: «Пхукет, Бангкок 15.12-25.12 до 60000».
+    cities, f = parse_filter(text, date.today())
+    if cities is None:
+        return f, False
+    replies, changed = [], False
+    for city in split_items(cities):
+        place = find_place(city)
+        if isinstance(place, str):
+            replies.append("❌ " + place)
+            continue
+        item = dict(f, name=place_name(place), city=place["name"], destination=place["code"],
+                    origin=settings["origin"], origin_name=settings["origin_name"])
+        settings.setdefault("filters", []).append(item)
+        replies.append(f"✅ Добавил подбор: {filter_text(item)}")
+        changed = True
+    if changed:
+        replies.append("Сообщу, как только найду такой билет.")
+    return "\n".join(replies), changed
 
 
 def split_price(text):
@@ -405,46 +450,60 @@ def set_origin(settings, text):
         return place, False
     settings["origin"] = place["code"]
     settings["origin_name"] = place["name"]
-    return f"✅ Теперь ищу билеты из города {place['name']} ({place['code']}).", True
+    return (f"✅ Город вылета: {place['name']} ({place['code']}).\n"
+            "Новые направления и подборы буду добавлять для вылета отсюда, "
+            "старые направления из других городов остаются."), True
 
 
 def add_route(settings, text):
-    city, price = split_price(text)
-    place = find_place(city)
-    if isinstance(place, str):
-        return place, False
-    if any(r["destination"] == place["code"] for r in settings["routes"]):
-        for r in settings["routes"]:
-            if r["destination"] == place["code"]:
-                r["max_price"] = price
-        return f"✅ Обновил порог для {place['name']}.", True
-    country = place["country"].upper()
-    name = f"{country} ({place['name']})" if country else place["name"].upper()
-    settings["routes"].append({"name": name, "city": place["name"],
-                               "destination": place["code"], "max_price": price})
-    limit = f"дешевле {fmt_price(price)} ₽" if price else "при резком падении цены"
-    return f"✅ Добавил {name}. Сообщу, когда билет будет {limit}.", True
+    """«Пхукет 20000, Бали 35к» или «Пхукет, Бали, Дубай 30000» (одна цена на всех)."""
+    items = [split_price(t) for t in split_items(text)]
+    priced = [p for _, p in items if p]
+    if len(priced) == 1 and items[-1][1]:
+        items = [(c, items[-1][1]) for c, _ in items]
+    replies, changed = [], False
+    for city, price in items:
+        place = find_place(city)
+        if isinstance(place, str):
+            replies.append("❌ " + place)
+            continue
+        limit = f"дешевле {fmt_price(price)} ₽" if price else "при резком падении цены"
+        existing = [r for r in settings["routes"]
+                    if r["destination"] == place["code"] and r["origin"] == settings["origin"]]
+        if existing:
+            existing[0]["max_price"] = price
+            replies.append(f"✅ {existing[0]['name']}: теперь сообщу, когда билет будет {limit}.")
+        else:
+            name = place_name(place)
+            settings["routes"].append({"name": name, "city": place["name"],
+                                       "destination": place["code"], "max_price": price,
+                                       "origin": settings["origin"],
+                                       "origin_name": settings["origin_name"]})
+            replies.append(f"✅ Добавил {name}: сообщу, когда билет будет {limit}.")
+        changed = True
+    return "\n".join(replies) or "Напиши город, например: Пхукет 20000", changed
 
 
 def remove_route(settings, text):
     if not text.strip().isdigit():
         return "Напиши номер направления из списка.", False
+    items = numbered_items(settings)
     i = int(text.strip()) - 1
-    routes, filters = settings["routes"], settings.get("filters", [])
-    if 0 <= i < len(routes):
-        r = routes.pop(i)
-        return f"🗑 Удалил {r['name']}.", True
-    if 0 <= i - len(routes) < len(filters):
-        f = filters.pop(i - len(routes))
-        return f"🗑 Удалил подбор: {filter_text(f)}", True
-    return "Нет направления с таким номером.", False
+    if not 0 <= i < len(items):
+        return "Нет направления с таким номером.", False
+    kind, item = items[i]
+    if kind == "route":
+        settings["routes"].remove(item)
+        return f"🗑 Удалил {item['name']} (вылет: {item['origin_name']}).", True
+    settings["filters"].remove(item)
+    return f"🗑 Удалил подбор: {filter_text(item)} (вылет: {item['origin_name']}).", True
 
 
 HELP = (
     "Я слежу за ценами на авиабилеты и пишу, когда находится дешёвый билет.\n\n"
     "Можно нажимать кнопки меню или писать сразу одной строкой:\n"
     "• откуда Санкт-Петербург\n"
-    "• добавить Пхукет 20000\n"
+    "• добавить Пхукет 20000, Бали 35000\n"
     "• подбор Пхукет 15.12-25.12 до 60000\n"
     "• подбор Бали декабрь до 70000 прямой\n"
     "• удалить 2"
@@ -465,11 +524,16 @@ def handle(text, state, settings, tg, token, cfg):
         return False
     if text == BTN_FROM:
         state["awaiting"] = "origin"
-        tg.send(f"Сейчас вылет из: {settings['origin_name']}.\nНапиши город, откуда хочешь улететь.")
+        tg.send(f"Сейчас вылет из: {settings['origin_name']}.\nНапиши город, откуда хочешь улететь. "
+                "После этого новые направления будут добавляться для него, "
+                "а старые останутся в своих городах.")
         return False
     if text == BTN_ADD:
         state["awaiting"] = "add"
         tg.send("Напиши город и максимальную цену, например: Пхукет 20000\n"
+                "Можно сразу несколько через запятую:\n"
+                "• Пхукет 20000, Бали 35000, Дубай 12000\n"
+                "• Пхукет, Бангкок, Нячанг 25000 — одна цена на всех\n"
                 "Без цены буду сообщать только о резких падениях.")
         return False
     if text == BTN_FILTER:
@@ -478,10 +542,11 @@ def handle(text, state, settings, tg, token, cfg):
                 "• Пхукет 15.12-25.12 до 60000 — туда-обратно в эти даты\n"
                 "• Стамбул 20.11 до 8000 — в одну сторону\n"
                 "• Бали декабрь до 70000 — туда-обратно с вылетом в декабре\n"
+                "• Пхукет, Бангкок 15.12-25.12 до 60000 — сразу несколько городов\n"
                 "Добавь «прямой», если нужны только рейсы без пересадок.")
         return False
     if text == BTN_REMOVE:
-        if not settings["routes"] and not settings.get("filters"):
+        if not numbered_items(settings):
             tg.send(routes_text(settings))
             return False
         state["awaiting"] = "remove"
@@ -536,6 +601,7 @@ class Bot:
             "origin_name": cfg.get("origin_name", cfg["origin"]),
             "routes": [dict(r, city=r.get("city", r["destination"])) for r in cfg["routes"]],
         }
+        ensure_origins(self.settings)
         self.state = load(STATE, {})
         self.history = load(HISTORY, {})
         self.sent = load(SENT, {})
