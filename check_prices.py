@@ -28,6 +28,8 @@ SETTINGS = ROOT / "data" / "settings.json"
 STATE = ROOT / "data" / "state.json"
 HISTORY = ROOT / "data" / "history.json"
 SENT = ROOT / "data" / "sent.json"
+ACCESS = ROOT / "data" / "access.json"  # кто ещё может пользоваться ботом
+USERS_DIR = ROOT / "data" / "users"  # настройки остальных людей: data/users/<chat id>/
 STATIONS_FILE = ROOT / "stations.json"
 
 MSK = timezone(timedelta(hours=3))
@@ -82,6 +84,22 @@ def fmt_price(n):
 
 # ---------- Telegram ----------
 
+def split_text(text, limit=4000):
+    """Делит длинный текст на части по абзацам (а если абзац длинный — по строкам)."""
+    parts, cur = [], ""
+    for block in text.split("\n\n"):
+        pieces = [block] if len(block) <= limit else \
+            [line[i:i + limit] for line in block.split("\n") for i in range(0, len(line) or 1, limit)]
+        sep = "\n\n"
+        for piece in pieces:
+            if cur and len(cur) + len(sep) + len(piece) > limit:
+                parts.append(cur)
+                cur = ""
+            cur = cur + sep + piece if cur else piece
+            sep = "\n"
+    return parts + [cur] if cur or not parts else parts
+
+
 class Telegram:
     def __init__(self, token, chat_id):
         self.token = token
@@ -105,8 +123,16 @@ class Telegram:
                                      for t, d in row] for row in buttons]}
 
     def send(self, text, buttons=None):
-        self.call("sendMessage", chat_id=self.chat_id, text=text,
+        parts = split_text(text)
+        for part in parts[:-1]:  # Телеграм не принимает сообщения длиннее 4096 знаков
+            self.call("sendMessage", chat_id=self.chat_id, text=part, disable_web_page_preview="true")
+        self.call("sendMessage", chat_id=self.chat_id, text=parts[-1],
                   reply_markup=self._markup(buttons), disable_web_page_preview="true")
+
+    def send_plain(self, text):
+        """Сообщение без кнопок и без нижнего меню (для тех, кому бот ещё не открыт)."""
+        self.call("sendMessage", chat_id=self.chat_id, text=text,
+                  reply_markup={"remove_keyboard": True})
 
     def edit(self, message_id, text, buttons):
         try:
@@ -544,9 +570,14 @@ def return_text(offer, rt, back, item=None):
     return "\n".join(lines)
 
 
-def format_alert(route, offer, reason, origin_name, extra=""):
+def shout(settings):
+    """«ГОША СРОЧНО» — у каждого человека своё имя в уведомлениях."""
+    return f"{settings.get('shout', 'ГОША')} СРОЧНО"
+
+
+def format_alert(route, offer, reason, origin_name, extra="", who="ГОША СРОЧНО"):
     return (
-        f"🔥 ГОША СРОЧНО {route['name']} {fmt_price(offer['price'])} ₽\n"
+        f"🔥 {who} {route['name']} {fmt_price(offer['price'])} ₽\n"
         f"{offer_line(offer, origin_name, route)}\n"
         + (f"{extra}\n" if extra else "")
         + f"Почему: {reason}"
@@ -588,7 +619,8 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
             if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
                 continue
             rt, back = return_info(token, origin, route["destination"], o, route)
-            tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route)),
+            tg.send(format_alert(route, o, reason, route["origin_name"], return_text(o, rt, back, route),
+                                 shout(settings)),
                     alert_buttons(route, offer_link(o), rt))
             sent[sent_key] = now.isoformat()
             alerts += 1
@@ -619,7 +651,7 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         if not f.get("round_trip"):
             rt, back = return_info(token, origin, f["destination"], o, f)
             extra = return_text(o, rt, back, f)
-        tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
+        tg.send(f"🎯 {shout(settings)} {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
                 f"{offer_line(o, f['origin_name'], f)}\n" + (f"{extra}\n" if extra else "")
                 + f"Подбор: {filter_text(f)}", alert_buttons(f, offer_link(o), rt))
         sent[sent_key] = now.isoformat()
@@ -658,10 +690,10 @@ def check_trains(tg, cfg, settings, history, sent, now):
             if sent_key in sent:
                 continue
             if "there" in o:
-                text = (f"🚆 ГОША СРОЧНО ПОЕЗД {t['from_name']} ⇄ {t['to_name']} "
+                text = (f"🚆 {shout(settings)} ПОЕЗД {t['from_name']} ⇄ {t['to_name']} "
                         f"{fmt_price(o['price'])} ₽ туда-обратно\n\n{train_pair_text(o)}\n\nПочему: {reason}")
             else:
-                text = (f"🚆 ГОША СРОЧНО ПОЕЗД {t['from_name']} → {t['to_name']} "
+                text = (f"🚆 {shout(settings)} ПОЕЗД {t['from_name']} → {t['to_name']} "
                         f"{fmt_price(o['price'])} ₽\n{train_offer_line(o)}\nПочему: {reason}")
             tg.send(text, train_buy_buttons(o) + alert_buttons(t))
             sent[sent_key] = now.isoformat()
@@ -753,6 +785,10 @@ POPULAR_STATIONS = [
 ]
 CARS = {"any": "любой", "plazcard": "плацкарт", "coupe": "купе", "sedentary": "сидячий", "lux": "СВ"}
 CAR_NAMES = dict(CARS, soft="люкс")
+# Части суток, как на Туту.ру: код, название, часы отправления [с, до).
+DAY_PARTS = [("m", "🌅 Утро", 6, 12), ("d", "☀️ День", 12, 18),
+             ("e", "🌆 Вечер", 18, 24), ("n", "🌙 Ночь", 0, 6)]
+DAY_PART_NAMES = {code: name for code, name, _, _ in DAY_PARTS}
 TRAIN_PRICES = [1000, 1500, 2000, 3000, 4000, 5000, 7000, 10000, 15000]
 
 
@@ -783,6 +819,26 @@ TUTU_CARS = {"RESERVED_SEAT": "plazcard", "COMPARTMENT": "coupe", "SEDENTARY": "
              "LUX": "lux", "SOFT": "soft"}
 
 
+def day_part(o):
+    """Часть суток, когда отправляется поезд: m, d, e, n (или "", если время неизвестно)."""
+    t = o.get("dep_time") or ""
+    if not t[:2].isdigit():
+        return ""
+    return next(code for code, _, lo, hi in DAY_PARTS if lo <= int(t[:2]) < hi)
+
+
+def day_part_label(code):
+    name, lo, hi = next((n, a, b) for c, n, a, b in DAY_PARTS if c == code)
+    return f"{name} ({lo}–{hi})"
+
+
+def times_text(times):
+    """["m", "e"] → «утро, вечер»; пусто → «любое»."""
+    if not times:
+        return "любое"
+    return ", ".join(DAY_PART_NAMES[c].split(" ", 1)[1].lower() for c, *_ in DAY_PARTS if c in times)
+
+
 def train_link(frm, to, day=None):
     link = f"{TUTU}/poezda/rasp_d.php?nnst1={frm}&nnst2={to}"
     if day:
@@ -793,6 +849,10 @@ def train_link(frm, to, day=None):
 def train_key(t):
     dates = "-".join(t["dates"]) if t.get("dates") else "any"
     back = "|back:" + "-".join(t["back_dates"]) if t.get("back_dates") else ""
+    if t.get("times"):
+        back += "|t:" + "".join(t["times"])
+    if t.get("back_dates") and t.get("back_times"):
+        back += "|bt:" + "".join(t["back_times"])
     return f"T|{t['from']}-{t['to']}|{t.get('car', 'any')}|{dates}{back}"
 
 
@@ -889,21 +949,31 @@ def train_offers(item):
     car = item.get("car", "any")
     if car != "any":
         offers = [o for o in offers if o["car"] == car]
+    if item.get("times"):  # только удобное время отправления (если время неизвестно — оставляем)
+        offers = [o for o in offers if day_part(o) in item["times"] or not day_part(o)]
     return offers
 
 
 def train_back_item(item):
     """Направление «обратно» для поезда туда-обратно."""
-    return dict(item, **{"from": item["to"], "to": item["from"], "dates": item["back_dates"]})
+    return dict(item, **{"from": item["to"], "to": item["from"], "dates": item["back_dates"],
+                         "times": item.get("back_times")})
 
 
-def train_trip_offers(item):
-    """Билеты по направлению. Для туда-обратно — самая дешёвая пара {price, there, back}."""
+def train_both(item):
+    """Поезда туда и (если нужно) обратно: (there, back)."""
     there = train_offers(item)
     if not item.get("back_dates") or not there:
-        return there
+        return there, []
     time.sleep(1)
-    back = train_offers(train_back_item(item))
+    return there, train_offers(train_back_item(item))
+
+
+def train_trip_offers(item, both=None):
+    """Билеты по направлению. Для туда-обратно — самая дешёвая пара {price, there, back}."""
+    there, back = both or train_both(item)
+    if not item.get("back_dates") or not there:
+        return there
 
     def moment(o, extra=0):
         start = datetime.fromisoformat(f"{o['date']}T{o.get('dep_time') or '00:00'}")
@@ -931,6 +1001,61 @@ def train_buy_buttons(o):
     if "there" in o:
         return [[("🎫 Купить туда", o["there"]["link"]), ("🎫 Купить обратно", o["back"]["link"])]]
     return [[("🎫 Купить билет", o["link"])]]
+
+
+def train_short(o, car=True, day=False):
+    """Одна строка: «1 087 ₽ · 07:30 · поезд 742У «Ласточка» · сидячий · 4 ч 10 мин · мест 36»."""
+    hours, minutes = divmod(o["seconds"] // 60, 60)
+    when = (f"{o['date'][8:]}.{o['date'][5:7]} " if day and o.get("date") else "") + (o["dep_time"] or "?")
+    parts = [f"{fmt_price(o['price'])} ₽", when,
+             f"поезд {o['train']}" + (f" «{o['name']}»" if o["name"] else "")]
+    if car:
+        parts.append(CAR_NAMES.get(o["car"], o["car"]))
+    parts.append(f"{hours} ч {minutes} мин в пути")
+    if o.get("seats"):
+        parts.append(f"мест {o['seats']}")
+    return " · ".join(parts)
+
+
+def by_day_part(offers, per_part):
+    """Самые дешёвые разные поезда в каждой части суток: [(код, [поезда по времени])]."""
+    groups = []
+    for code in [c for c, *_ in DAY_PARTS] + [""]:
+        best = []
+        for o in sorted((o for o in offers if day_part(o) == code), key=lambda o: o["price"]):
+            if all((o["train"], o.get("date")) != (b["train"], b.get("date")) for b in best):
+                best.append(o)
+            if len(best) == per_part:
+                break
+        if best:
+            groups.append((code, sorted(best, key=lambda o: (o.get("date", ""), o["dep_time"]))))
+    return groups
+
+
+def day_parts_text(item, offers, per_part):
+    """Билеты по частям суток: утро, день, вечер, ночь."""
+    car = item.get("car", "any") == "any"
+    day = bool(item.get("dates")) and item["dates"][0] != item["dates"][1]
+    lines = []
+    for code, group in by_day_part(offers, per_part):
+        label = day_part_label(code) if code else "🕐 Время не указано"
+        if per_part == 1:
+            lines.append(f"{label.split(' (')[0]}: {train_short(group[0], car, day)}")
+        else:
+            lines.append(label)
+            lines += [f"• {train_short(o, car, day)}" for o in group]
+    return "\n".join(lines)
+
+
+def train_day_buttons(offers):
+    """Кнопки «Купить»: одна, если все поезда в один день, иначе по кнопке на каждый день."""
+    links = {}
+    for o in sorted(offers, key=lambda o: o.get("date", "")):
+        links.setdefault(o["link"], o.get("date"))
+    if len(links) == 1:
+        return [[("🎫 Купить билет", next(iter(links)))]]
+    buttons = [(f"🎫 {d[8:]}.{d[5:7]}" if d else "🎫 Купить", link) for link, d in links.items()]
+    return [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
 
 
 def train_offer_line(o, note=True, link=True):
@@ -972,16 +1097,22 @@ def train_prices(settings):
     if not trains:
         return "Поездов пока нет, добавь их в меню 🏠 → 🚆 Поезда"
     for t in trains:
-        offers = train_trip_offers(t)
+        both = train_both(t)
+        offers = train_trip_offers(t, both)
+        times = f" (отправление: {times_text(t.get('times'))})" if t.get("times") else ""
         if not offers:
-            lines.append(f"{train_title(t)}: билетов не нашёл")
+            lines.append(f"\n{train_title(t)}{times}: билетов не нашёл")
             continue
         best = min(offers, key=lambda o: o["price"])
         if "there" in best:
-            lines.append(f"{train_title(t)}: {fmt_price(best['price'])} ₽ туда-обратно\n"
-                         + train_pair_text(best))
+            lines.append(f"\n{train_title(t)}{times}: от {fmt_price(best['price'])} ₽ туда-обратно\n"
+                         f"➡️ Туда:\n{day_parts_text(t, both[0], 1)}\n"
+                         f"⬅️ Обратно:\n{day_parts_text(t, both[1], 1)}\n"
+                         f"Купить туда: {best['there']['link']}\nКупить обратно: {best['back']['link']}")
         else:
-            lines.append(f"{train_title(t)}: {fmt_price(best['price'])} ₽\n{train_offer_line(best)}")
+            note = "" if best.get("date") else "\nЭто цены «от»: даты и места смотри на Туту.ру"
+            lines.append(f"\n{train_title(t)}{times}: от {fmt_price(best['price'])} ₽\n"
+                         f"{day_parts_text(t, offers, 1)}{note}\nКупить: {best['link']}")
     return "\n".join(lines)
 
 
@@ -1310,6 +1441,8 @@ def home_screen(settings):
     lines.append("\nНажми на город вылета или на «🚆 Поезда», чтобы настроить направления.")
     buttons.append([("➕ Город вылета", "no"), ("💰 Все цены", "pa")])
     buttons.append([(f"🚆 Поезда  ({len(trains)})", "t")])
+    if settings.get("owner"):
+        buttons.append([("👥 Друзья", "users")])
     return "\n".join(lines), buttons
 
 
@@ -1362,6 +1495,8 @@ def train_screen(item, note=""):
     else:
         lines.append("Даты: любые (цены «от» по данным Туту.ру, без конкретной даты)")
     lines.append("Вагон: " + CARS[item.get("car", "any")])
+    lines.append("Отправление: " + times_text(item.get("times"))
+                 + (", обратно: " + times_text(item.get("back_times")) if rt else ""))
     what = "билеты туда и обратно вместе" if rt else "билет"
     lines.append(f"Сообщу, когда {what} дешевле {fmt_price(item['max_price'])} ₽ "
                  "или резко подешевеет." if item.get("max_price")
@@ -1376,12 +1511,36 @@ def train_screen(item, note=""):
         [("📅 Туда: " + train_dates_short(item) if item.get("dates") else "📅 Даты", f"id:{i}")]
         + ([("🔁 Обратно: " + (train_dates_short(item, "back_dates") if rt else "нет"), f"ij:{i}")]
            if item.get("dates") else []),
+        [("🕐 Время отправления: " + times_text(item.get("times"))
+          + (" / " + times_text(item.get("back_times")) if rt else ""), f"iw:{i}")],
         [("🛏 Вагон: " + CARS[item.get("car", "any")], f"iv:{i}"),
          ("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
         [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
         [("⬅️ Поезда", "t")],
     ]
     return "\n".join(lines), buttons
+
+
+def train_times_screen(item):
+    i = item["id"]
+    rt = bool(item.get("back_dates"))
+    lines = [f"🕐 {train_title(item)}\n",
+             "Во сколько тебе удобно отправляться? Отметь одно или несколько — "
+             "буду искать и присылать только такие поезда."]
+    buttons = []
+    for field, title in (("times", "➡️ Туда"), ("back_times", "⬅️ Обратно")):
+        if field == "back_times" and not rt:
+            break
+        chosen = item.get(field) or []
+        if rt:
+            buttons.append([(f"— {title} —", "noop")])
+        parts = [(("✅ " if c in chosen else "") + day_part_label(c), f"iw:{i}:{field}:{c}")
+                 for c, *_ in DAY_PARTS]
+        buttons += [parts[:2], parts[2:]]
+        buttons.append([(("✅ " if not chosen else "") + "Любое время", f"iw:{i}:{field}:any")])
+    lines.append("\nСейчас: " + times_text(item.get("times"))
+                 + (", обратно: " + times_text(item.get("back_times")) if rt else ""))
+    return "\n".join(lines), buttons + [[("✅ Готово", f"if:{i}")]]
 
 
 def item_screen(settings, item_id, note=""):
@@ -1703,7 +1862,7 @@ def train_wizard_next(state, settings, tg, token, cfg, show):
         item["back_dates"] = wiz["back_dates"]
     same = ("from", "to", "car", "dates", "back_dates")
     settings["trains"] = [t for t in settings["trains"]
-                          if [t.get(f) for f in same] != [item[f] for f in same]]
+                          if [t.get(f) for f in same] != [item.get(f) for f in same]]
     settings["trains"].append(item)
     state.pop("wiz", None)
     state.pop("awaiting", None)
@@ -1994,7 +2153,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
 
     # Карточка направления
     elif cmd in ("i", "ip", "it", "id", "ik", "iu", "ia", "ij", "il", "io", "ig", "ir", "ic", "ih", "ib",
-                 "ie", "iy", "iv", "iz", "in", "iq", "ix"):
+                 "ie", "iy", "iv", "iz", "in", "iq", "ix", "iw", "if"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -2087,29 +2246,57 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             note = "⏸ Поставил на паузу.\n" if item["paused"] else "▶️ Снова слежу.\n"
         elif cmd == "in" and kind == "train":
             tg.send("🔎 Ищу цены…")
-            offers = train_trip_offers(item)
+            both = train_both(item)
+            offers = train_trip_offers(item, both)
             remember_price(item, offers, datetime.now(timezone.utc))
-            back = [[("⬅️ К направлению", f"i:{item_id}")]]
+            back = [[("🕐 Время отправления: " + times_text(item.get("times"))
+                      + (" / " + times_text(item.get("back_times")) if item.get("back_dates") else ""),
+                      f"iw:{item_id}")],
+                    [("⬅️ К направлению", f"i:{item_id}")]]
+            times = ""
+            if item.get("times") or (item.get("back_dates") and item.get("back_times")):
+                times = ("\nПоказываю только отправление: " + times_text(item.get("times"))
+                         + (", обратно: " + times_text(item.get("back_times")) if item.get("back_dates") else "")
+                         + ". Поменять — кнопка «🕐 Время отправления».")
             if not offers:
-                tg.send(f"{train_title(item)}: билетов не нашёл 😔", back)
+                tg.send(f"{train_title(item)}: билетов не нашёл 😔{times}", back)
                 return False
             if "there" in offers[0]:
                 o = offers[0]
-                tg.send(f"💰 {train_title(item)}: {fmt_price(o['price'])} ₽ туда-обратно\n\n"
-                        + train_pair_text(o, link=False), train_buy_buttons(o) + back)
+                tg.send(f"💰 {train_title(item)}: от {fmt_price(o['price'])} ₽ туда-обратно{times}\n\n"
+                        "Самая дешёвая пара:\n" + train_pair_text(o, link=False)
+                        + "\n\n➡️ Туда, по времени суток:\n" + day_parts_text(item, both[0], 2)
+                        + "\n\n⬅️ Обратно, по времени суток:\n"
+                        + day_parts_text(train_back_item(item), both[1], 2),
+                        train_buy_buttons(o) + back)
                 return False
-            best = []  # три самых дешёвых разных поезда
-            for o in sorted(offers, key=lambda o: o["price"]):
-                if all((o["train"], o.get("date")) != (b["train"], b.get("date")) for b in best):
-                    best.append(o)
-            best = best[:3]
+            best = min(offers, key=lambda o: o["price"])
             note = ("" if item.get("dates")
                     else "\n\nЭто цены «от»: даты и места смотри на Туту.ру")
-            tg.send(f"💰 {train_title(item)}: от {fmt_price(best[0]['price'])} ₽\n\n"
-                    + "\n\n".join(f"{fmt_price(o['price'])} ₽ · " + train_offer_line(o, False, False)
-                                  for o in best) + note,
-                    [[("🎫 Купить билет", best[0]["link"])]] + back)
+            tg.send(f"💰 {train_title(item)}: от {fmt_price(best['price'])} ₽{times}\n"
+                    "Самые дешёвые поезда по времени отправления:\n\n"
+                    + day_parts_text(item, offers, 3) + note,
+                    train_day_buttons(offers) + back)
             return False
+        elif cmd == "iw" and kind == "train":
+            field, _, code = extra.partition(":")
+            if field in ("times", "back_times") and code:
+                chosen = set(item.get(field) or [])
+                chosen = set() if code == "any" else chosen ^ {code}
+                if len(chosen) == len(DAY_PARTS):
+                    chosen = set()  # все части суток = любое время
+                if chosen:
+                    item[field] = [c for c, *_ in DAY_PARTS if c in chosen]
+                else:
+                    item.pop(field, None)
+                item.pop("last_price", None)
+            edit(*train_times_screen(item))
+            return False
+        elif cmd == "if":
+            note = "✅ Время отправления: " + times_text(item.get("times"))
+            if item.get("back_dates"):
+                note += ", обратно: " + times_text(item.get("back_times"))
+            note += "\n"
         elif cmd == "in":
             tg.send("🔎 Ищу цены…")
             all_offers, offers = item_offers(token, kind, item, cfg)
@@ -2147,7 +2334,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                    else origin_screen(settings, item["origin"])))
             return False
         edit(*item_screen(settings, item_id, note))
-        return cmd in ("ip", "ir", "ic", "ih", "iv", "ia", "ig")
+        return cmd in ("ip", "ir", "ic", "ih", "iv", "ia", "ig", "if")
 
     # Цены
     elif cmd in ("p", "pa"):
@@ -2158,60 +2345,226 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     return False
 
 
-def process_messages(tg, token, cfg, settings, state, wait=0):
-    changed = False
-    for upd in tg.updates(state.get("offset", 0), wait):
-        state["offset"] = upd["update_id"] + 1
-        cq = upd.get("callback_query")
-        msg = (cq or {}).get("message") or upd.get("message") or {}
-        # Слушаемся только владельца бота.
-        if str(msg.get("chat", {}).get("id")) != tg.chat_id:
-            continue
-        try:
-            if cq:
-                tg.answer(cq["id"])
-                changed |= bool(handle_button(cq.get("data", ""), msg["message_id"],
-                                              state, settings, tg, token, cfg))
-            elif "text" in msg:
-                changed |= bool(handle(msg["text"], state, settings, tg, token, cfg))
-        except Exception as e:  # noqa: BLE001
-            print(f"handle error: {e!r}", file=sys.stderr)
-            tg.send("Что-то пошло не так, попробуй ещё раз.", back_button(settings, None))
-    return changed
+# ---------- Люди: владелец и друзья по приглашению ----------
+
+ACCESS_CMDS = {"users", "ua", "ud", "uq", "ux"}
+
+
+def person_label(info):
+    info = info or {}
+    name = info.get("name") or "Без имени"
+    return name + (f" (@{info['username']})" if info.get("username") else "")
+
+
+class User:
+    """Настройки, состояние и история одного человека.
+
+    Владелец хранится в data/ (как раньше), остальные — в data/users/<chat id>/.
+    """
+
+    def __init__(self, chat_id, folder, tg, default_settings):
+        self.chat_id = str(chat_id)
+        self.dir = folder
+        self.tg = tg
+        self.settings = load(folder / "settings.json", None) or default_settings
+        ensure_origins(self.settings)
+        self.state = load(folder / "state.json", {})
+        self.history = load(folder / "history.json", {})
+        self.sent = load(folder / "sent.json", {})
+
+    def save(self):
+        for name in ("settings", "state", "history", "sent"):
+            save(self.dir / f"{name}.json", getattr(self, name))
+
+
+def users_screen(access, users, bot_link=""):
+    lines = ["👥 Друзья\n"]
+    buttons = []
+    allowed = access["allowed"]
+    if allowed:
+        lines.append("Пользуются ботом (нажми, чтобы убрать):")
+        for uid, info in allowed.items():
+            settings = users[uid].settings if uid in users else {}
+            n = len(settings.get("routes", [])) + len(settings.get("filters", [])) \
+                + len(settings.get("trains", []))
+            buttons.append([(f"👤 {person_label(info)} · направлений {n}", f"uq:{uid}")])
+    else:
+        lines.append("Пока ботом пользуешься только ты.")
+    for uid, info in access["pending"].items():
+        lines.append(f"\n⏳ Просится: {person_label(info)}")
+        buttons.append([(f"✅ Пустить {info.get('name') or ''}".strip(), f"ua:{uid}"),
+                        ("🚫 Нет", f"ud:{uid}")])
+    for uid, info in access["denied"].items():
+        buttons.append([(f"↩️ Всё-таки пустить {person_label(info)}", f"ua:{uid}")])
+    lines.append("\nКак пригласить: отправь другу ссылку на бота"
+                 + (f" {bot_link}" if bot_link else "")
+                 + ". Друг напишет боту, а тебе придёт запрос «Пустить?». "
+                 "У каждого свои направления и уведомления, твои они не видят.")
+    return "\n".join(lines), buttons + [[("⬅️ В меню", "home")]]
 
 
 class Bot:
     def __init__(self):
         self.token = os.environ["TRAVELPAYOUTS_TOKEN"]
-        self.tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
+        self.bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+        owner_id = str(os.environ["TELEGRAM_CHAT_ID"])
+        self.tg = Telegram(self.bot_token, owner_id)
         self.cfg = load(CONFIG, {})
         cfg = self.cfg
-        self.settings = load(SETTINGS, None) or {
+        self.owner = User(owner_id, ROOT / "data", self.tg, {
             "origin": cfg["origin"],
             "origin_name": cfg.get("origin_name", cfg["origin"]),
             "routes": [dict(r, city=r.get("city", r["destination"])) for r in cfg["routes"]],
-        }
-        ensure_origins(self.settings)
-        self.state = load(STATE, {})
-        self.history = load(HISTORY, {})
-        self.sent = load(SENT, {})
+        })
+        self.owner.settings["owner"] = True
+        self.access = load(ACCESS, {})
+        for key in ("allowed", "pending", "denied"):
+            self.access.setdefault(key, {})
+        self.users = {owner_id: self.owner}
+        for uid in self.access["allowed"]:
+            self.users[uid] = self.load_user(uid)
+        self.bot_link = ""
+
+    # Старые имена: настройки и состояние владельца.
+    settings = property(lambda self: self.owner.settings)
+    state = property(lambda self: self.owner.state)
+    history = property(lambda self: self.owner.history)
+    sent = property(lambda self: self.owner.sent)
+
+    def load_user(self, uid):
+        info = self.access["allowed"].get(uid) or {}
+        first = (info.get("name") or "").split(" ")[0]
+        return User(uid, USERS_DIR / uid, Telegram(self.bot_token, uid), {
+            "origin": self.cfg["origin"],
+            "origin_name": self.cfg.get("origin_name", self.cfg["origin"]),
+            "routes": [], "filters": [], "trains": [],
+            "shout": first.upper() if first else "ЭЙ",
+        })
+
+    def stranger(self, uid, chat):
+        """Пишет человек, которому бот ещё не открыт: спрашиваем владельца."""
+        if uid in self.access["denied"]:
+            return
+        tg = Telegram(self.bot_token, uid)
+        if uid in self.access["pending"]:
+            tg.send_plain("Запрос уже у владельца бота. Как только доступ откроют, я напишу.")
+            return
+        name = " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+        info = {"name": name, "username": chat.get("username"),
+                "ts": datetime.now(timezone.utc).isoformat()}
+        self.access["pending"][uid] = info
+        tg.send_plain("Привет! Это личный бот для поиска дешёвых билетов. "
+                      "Я отправил запрос владельцу бота. Как только доступ откроют, я напишу.")
+        self.tg.send(f"👤 {person_label(info)} хочет пользоваться ботом. Пустить?",
+                     [[("✅ Пустить", f"ua:{uid}"), ("🚫 Нет", f"ud:{uid}")]])
+
+    def get_bot_link(self):
+        if not self.bot_link:
+            try:
+                name = self.tg.call("getMe").get("result", {}).get("username")
+                self.bot_link = f"https://t.me/{name}" if name else ""
+            except Exception as e:  # noqa: BLE001
+                print(f"getMe error: {e!r}", file=sys.stderr)
+        return self.bot_link
+
+    def access_button(self, data, message_id):
+        cmd, _, uid = data.partition(":")
+        edit = lambda t, b: self.tg.edit(message_id, t, b)  # noqa: E731
+        people = [[("👥 Друзья", "users")]]
+        acc = self.access
+        if cmd == "users":
+            edit(*users_screen(acc, self.users, self.get_bot_link()))
+        elif cmd == "ua":
+            if uid in acc["allowed"]:
+                edit(f"{person_label(acc['allowed'][uid])} уже пользуется ботом.", people)
+                return
+            info = acc["pending"].pop(uid, None) or acc["denied"].pop(uid, None)
+            if info is None:
+                edit("Этого запроса уже нет.", people)
+                return
+            acc["allowed"][uid] = info
+            user = self.users[uid] = self.load_user(uid)
+            user.tg.send("✅ Доступ открыт! Вот как я работаю:\n\n" + HELP)
+            user.tg.send(*home_screen(user.settings))
+            edit(f"✅ Пустил: {person_label(info)}. Твои направления этот человек не видит.", people)
+        elif cmd == "ud":
+            info = acc["pending"].pop(uid, None)
+            if info is not None:
+                acc["denied"][uid] = info
+                Telegram(self.bot_token, uid).send_plain("Владелец бота не открыл доступ, извини.")
+            edit(f"🚫 Не пустил: {person_label(info)}", people)
+        elif cmd == "uq" and uid in acc["allowed"]:
+            edit(f"Убрать {person_label(acc['allowed'][uid])}? Бот перестанет отвечать этому человеку "
+                 "и присылать ему билеты.", [[("🗑 Да, убрать", f"ux:{uid}"), ("Отмена", "users")]])
+        elif cmd == "ux" and uid in acc["allowed"]:
+            info = acc["allowed"].pop(uid)
+            user = self.users.pop(uid, None)
+            if user:
+                user.save()  # настройки остаются на диске: если пустишь снова, всё вернётся
+            edit(f"🗑 Убрал: {person_label(info)}", people)
+        else:
+            edit(*users_screen(acc, self.users, self.get_bot_link()))
+
+    def process_messages(self, wait=0):
+        """Читает новые сообщения. Возвращает chat id людей, у которых поменялись направления."""
+        changed = set()
+        state = self.owner.state
+        for upd in self.tg.updates(state.get("offset", 0), wait):
+            state["offset"] = upd["update_id"] + 1
+            cq = upd.get("callback_query")
+            msg = (cq or {}).get("message") or upd.get("message") or {}
+            chat = msg.get("chat", {})
+            if chat.get("type", "private") != "private":
+                continue  # в группах бот не работает
+            uid = str(chat.get("id"))
+            user = self.users.get(uid)
+            try:
+                if user is None:
+                    if cq:
+                        self.tg.answer(cq["id"])
+                    else:
+                        self.stranger(uid, chat)
+                    continue
+                if cq:
+                    user.tg.answer(cq["id"])
+                    data = cq.get("data", "")
+                    if user is self.owner and data.partition(":")[0] in ACCESS_CMDS:
+                        self.access_button(data, msg["message_id"])
+                    elif handle_button(data, msg["message_id"], user.state, user.settings,
+                                       user.tg, self.token, self.cfg):
+                        changed.add(uid)
+                elif "text" in msg:
+                    if handle(msg["text"], user.state, user.settings, user.tg, self.token, self.cfg):
+                        changed.add(uid)
+            except Exception as e:  # noqa: BLE001
+                print(f"handle error {uid}: {e!r}", file=sys.stderr)
+                if user is not None:
+                    user.tg.send("Что-то пошло не так, попробуй ещё раз.",
+                                 back_button(user.settings, None))
+        return changed
 
     def step(self, wait=0):
         """Один проход: сообщения, затем (если пора) проверка цен, затем сохранение."""
-        changed = process_messages(self.tg, self.token, self.cfg, self.settings, self.state, wait)
+        changed = self.process_messages(wait)
         now = datetime.now(timezone.utc)
-        last = self.state.get("last_check")
+        state = self.owner.state
+        last = state.get("last_check")
         due = not last or now - datetime.fromisoformat(last) >= timedelta(
             minutes=self.cfg["check_every_minutes"] - 5)
-        if due or changed:
-            check_prices(self.tg, self.token, self.cfg, self.settings, self.history, self.sent, now)
-            self.state["last_check"] = now.isoformat()
+        for uid, user in list(self.users.items()):
+            if not (due or uid in changed):
+                continue
+            try:
+                check_prices(user.tg, self.token, self.cfg, user.settings, user.history, user.sent, now)
+            except Exception as e:  # noqa: BLE001
+                print(f"check error {uid}: {e!r}", file=sys.stderr)
             week_ago = now - timedelta(days=7)
-            self.sent = {k: v for k, v in self.sent.items() if datetime.fromisoformat(v) >= week_ago}
-        save(SETTINGS, self.settings)
-        save(STATE, self.state)
-        save(HISTORY, self.history)
-        save(SENT, self.sent)
+            user.sent = {k: v for k, v in user.sent.items() if datetime.fromisoformat(v) >= week_ago}
+        if due or self.owner.chat_id in changed:
+            state["last_check"] = now.isoformat()
+        for user in self.users.values():
+            user.save()
+        save(ACCESS, self.access)
 
 
 def main():
