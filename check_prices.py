@@ -1441,21 +1441,49 @@ def pick_car_screen(wiz):
 
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-TRAIN_DATES_HINT = ("Нажми на дату или напиши свою: 15.12 — один день, "
-                    "15.12-20.12 — несколько дней подряд (до 7).\n"
-                    "«Любая дата» — слежу за ценами «от» без конкретной даты.")
+TRAIN_DATES_HINT = ("Напиши дату поездки:\n"
+                    "• 15.12 — один день\n"
+                    "• 15.12-20.12 — несколько дней подряд (до 7), найду самый дешёвый\n"
+                    "• «любая» — слежу за ценами «от» без конкретной даты")
+TRAIN_DAYS_AHEAD = 120  # билеты на поезда продают примерно на 3–4 месяца вперёд
 
 
-def pick_train_dates_screen(title, prefix, cancel):
-    """Даты для поезда: ближайшие пятницы–воскресенья кнопками, свои даты текстом."""
-    days, d = [], datetime.now(MSK).date() + timedelta(days=1)
-    while len(days) < 6:
-        if d.weekday() >= 4:
-            days.append(d)
+def calendar_rows(month, pick, nav, lo, hi):
+    """Календарь месяца кнопками: день → pick + YYYY-MM-DD, листание → nav + YYYY-MM."""
+    first = month.replace(day=1)
+    rows_ = [[(f"{MONTH_NOM[first.month].capitalize()} {first.year}", "noop")],
+             [(w, "noop") for w in WEEKDAYS]]
+    row = [(" ", "noop")] * first.weekday()
+    d = first
+    while d.month == first.month:
+        row.append((str(d.day), f"{pick}{d.isoformat()}") if lo <= d <= hi else ("·", "noop"))
+        if len(row) == 7:
+            rows_.append(row)
+            row = []
         d += timedelta(days=1)
-    btns = [(f"{WEEKDAYS[d.weekday()]} {d:%d.%m}", f"{prefix}{d.isoformat()}") for d in days]
-    return (f"{title}: когда едем?\n\n{TRAIN_DATES_HINT}",
-            rows(btns, 3) + [[("📅 Любая дата", f"{prefix}any")], cancel])
+    if row:
+        rows_.append(row + [(" ", "noop")] * (7 - len(row)))
+    prev = (first - timedelta(days=1)).replace(day=1)
+    nxt = (first + timedelta(days=32)).replace(day=1)
+    rows_.append([("◀️", f"{nav}{prev:%Y-%m}") if prev >= lo.replace(day=1) else (" ", "noop"),
+                  ("▶️", f"{nav}{nxt:%Y-%m}") if nxt <= hi else (" ", "noop")])
+    return rows_
+
+
+def pick_train_dates_screen(title, prefix, cancel, nav, write, month=None):
+    """Даты для поезда: календарь, ближайшие выходные, своя дата текстом или «любая дата»."""
+    today = datetime.now(MSK).date()
+    lo, hi = today, today + timedelta(days=TRAIN_DAYS_AHEAD)
+    weekend, d = [], today + timedelta(days=1)
+    while len(weekend) < 3:
+        if d.weekday() >= 4:
+            weekend.append(d)
+        d += timedelta(days=1)
+    btns = [(f"{WEEKDAYS[d.weekday()]} {d:%d.%m}", f"{prefix}{d.isoformat()}") for d in weekend]
+    text = (f"{title}: когда едем?\n\nНажми на день в календаре или на ближайшие выходные. "
+            "Несколько дней подряд можно вписать кнопкой «✏️ Вписать свою дату».")
+    return (text, [btns] + calendar_rows(month or today, prefix, nav, lo, hi)
+            + [[("✏️ Вписать свою дату", write), ("📅 Любая дата", f"{prefix}any")], cancel])
 
 
 def parse_train_dates(text, today):
@@ -1549,6 +1577,10 @@ def wizard_next(state, settings, tg, token, cfg, message_id=None):
     show(*item_screen(settings, item["id"], "✅ Добавлено! Я уже проверяю цены.\n"))
 
 
+def train_dates_wizard_screen(wiz, month=None):
+    return pick_train_dates_screen(f"🚆 {wiz['city']}", "wd:", wiz_cancel(wiz), "wk:", "we", month)
+
+
 def train_wizard_next(state, settings, tg, token, cfg, show):
     wiz = state["wiz"]
     if "to" not in wiz:
@@ -1558,7 +1590,7 @@ def train_wizard_next(state, settings, tg, token, cfg, show):
         return show(*pick_car_screen(wiz))
     if "dates" not in wiz:
         state["awaiting"] = {"type": "wiz_tdates"}
-        return show(*pick_train_dates_screen(f"🚆 {wiz['city']}", "wd:", wiz_cancel(wiz)))
+        return show(*train_dates_wizard_screen(wiz))
     if "price" not in wiz:
         state["awaiting"] = {"type": "wiz_price"}
         return show(*pick_price_screen(wiz, wizard_current_price(token, cfg, settings, wiz)))
@@ -1723,6 +1755,8 @@ def handle(text, state, settings, tg, token, cfg):
 
 def handle_button(data, message_id, state, settings, tg, token, cfg):
     """Обрабатывает нажатие кнопки под сообщением. Возвращает True, если стоит проверить цены."""
+    if data == "noop":  # заголовки и пустые клетки календаря
+        return False
     cmd, _, arg = data.partition(":")
     if not cmd.startswith("w"):
         state.pop("awaiting", None)
@@ -1775,6 +1809,13 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     elif cmd == "wv" and state.get("wiz", {}).get("kind") == "t":
         state["wiz"]["car"] = arg
         wizard_next(state, settings, tg, token, cfg, message_id)
+    elif cmd == "wk" and state.get("wiz", {}).get("kind") == "t":
+        state["awaiting"] = {"type": "wiz_tdates"}
+        edit(*train_dates_wizard_screen(state["wiz"], date.fromisoformat(arg + "-01")))
+    elif cmd == "we" and state.get("wiz", {}).get("kind") == "t":
+        state["awaiting"] = {"type": "wiz_tdates"}
+        edit(f"🚆 {state['wiz']['city']}: {TRAIN_DATES_HINT[0].lower()}{TRAIN_DATES_HINT[1:]}",
+             [[("⬅️ К календарю", "wk:" + date.today().strftime("%Y-%m"))]])
     elif cmd == "wd" and state.get("wiz", {}).get("kind") == "t":
         state["wiz"]["dates"] = None if arg == "any" else [arg, arg]
         wizard_next(state, settings, tg, token, cfg, message_id)
@@ -1796,8 +1837,8 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
 
     # Карточка направления
-    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "ib", "ie", "iy", "iv", "iz", "in", "iq",
-                 "ix"):
+    elif cmd in ("i", "ip", "it", "id", "ik", "iu", "ia", "ir", "ic", "ih", "ib", "ie", "iy", "iv", "iz",
+                 "in", "iq", "ix"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -1817,10 +1858,17 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             tg.send(f"{item['city']}: напиши новую цену, например {example}.",
                     [[("⬅️ Отмена", f"i:{item_id}")]])
             return False
-        elif cmd == "id" and kind == "train":
+        elif cmd in ("id", "ik") and kind == "train":
             state["awaiting"] = {"type": "item_dates", "id": item_id}
+            month = date.fromisoformat(extra + "-01") if cmd == "ik" else None
             edit(*pick_train_dates_screen(f"🚆 {item['city']}", f"ia:{item_id}:",
-                                          [("⬅️ Отмена", f"i:{item_id}")]))
+                                          [("⬅️ Отмена", f"i:{item_id}")], f"ik:{item_id}:",
+                                          f"iu:{item_id}", month))
+            return False
+        elif cmd == "iu":
+            state["awaiting"] = {"type": "item_dates", "id": item_id}
+            edit(f"🚆 {item['city']}: {TRAIN_DATES_HINT[0].lower()}{TRAIN_DATES_HINT[1:]}",
+                 [[("⬅️ К календарю", f"id:{item_id}")]])
             return False
         elif cmd == "ia":
             item["dates"] = None if extra == "any" else [extra, extra]
