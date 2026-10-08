@@ -1,8 +1,8 @@
-name: Проверка источников цен на поезда (временно)
+name: Проверка живых цен (временно)
 on:
   push:
     branches: [probe-trains]
-    paths: [probe/probe.py, .github/workflows/probe.yml]
+    paths: [probe/probe.py, .github/workflows/probe.yml, check_prices.py]
 jobs:
   probe:
     runs-on: ubuntu-latest
