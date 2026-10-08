@@ -1,16 +1,19 @@
 """Бот дешёвых авиабилетов: команды в Telegram + проверка цен через Travelpayouts.
 
-Запускается по расписанию из GitHub Actions. За один запуск:
-1. читает новые сообщения в Telegram и отвечает на команды меню;
-2. если с прошлой проверки прошло больше check_every_minutes, проверяет цены
-   и шлёт алерты.
-Настройки, история цен и состояние хранятся в data/*.json и коммитятся обратно.
+Два режима:
+- `python check_prices.py` — один проход (для GitHub Actions по расписанию);
+- `python check_prices.py --serve` — работает постоянно на сервере и отвечает
+  на сообщения сразу.
+За проход бот читает новые сообщения в Telegram, отвечает на команды меню и,
+если с прошлой проверки прошло check_every_minutes, проверяет цены и шлёт алерты.
+Настройки, история цен и состояние хранятся в data/*.json.
 """
 import json
 import os
 import re
 import statistics
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -61,13 +64,13 @@ class Telegram:
         self.token = token
         self.chat_id = str(chat_id)
 
-    def call(self, method, **params):
+    def call(self, method, http_timeout=30, **params):
         body = urllib.parse.urlencode(
             {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
              for k, v in params.items()}
         ).encode()
         url = f"https://api.telegram.org/bot{self.token}/{method}"
-        with urllib.request.urlopen(url, data=body, timeout=30) as resp:
+        with urllib.request.urlopen(url, data=body, timeout=http_timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def send(self, text):
@@ -75,8 +78,10 @@ class Telegram:
         self.call("sendMessage", chat_id=self.chat_id, text=text,
                   reply_markup=keyboard, disable_web_page_preview="true")
 
-    def updates(self, offset):
-        return self.call("getUpdates", offset=offset, timeout=0).get("result", [])
+    def updates(self, offset, wait=0):
+        """wait > 0 — long polling: ждём новых сообщений до wait секунд."""
+        return self.call("getUpdates", http_timeout=wait + 15,
+                         offset=offset, timeout=wait).get("result", [])
 
 
 # ---------- Справочник городов ----------
@@ -280,9 +285,11 @@ HELP = (
     "Можно нажимать кнопки меню или писать сразу одной строкой:\n"
     "• откуда Санкт-Петербург\n"
     "• добавить Пхукет 20000\n"
-    "• удалить 2\n\n"
-    "Я отвечаю не мгновенно, а при очередной проверке (раз в ~30 минут)."
+    "• удалить 2"
 )
+SERVE = "--serve" in sys.argv
+if not SERVE:
+    HELP += "\n\nЯ отвечаю не мгновенно, а при очередной проверке (раз в ~30 минут)."
 
 
 def handle(text, state, settings, tg, token, cfg):
@@ -332,9 +339,9 @@ def handle(text, state, settings, tg, token, cfg):
     return False
 
 
-def process_messages(tg, token, cfg, settings, state):
+def process_messages(tg, token, cfg, settings, state, wait=0):
     changed = False
-    for upd in tg.updates(state.get("offset", 0)):
+    for upd in tg.updates(state.get("offset", 0), wait):
         state["offset"] = upd["update_id"] + 1
         msg = upd.get("message") or {}
         # Слушаемся только владельца бота.
@@ -348,35 +355,51 @@ def process_messages(tg, token, cfg, settings, state):
     return changed
 
 
+class Bot:
+    def __init__(self):
+        self.token = os.environ["TRAVELPAYOUTS_TOKEN"]
+        self.tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
+        self.cfg = load(CONFIG, {})
+        cfg = self.cfg
+        self.settings = load(SETTINGS, None) or {
+            "origin": cfg["origin"],
+            "origin_name": cfg.get("origin_name", cfg["origin"]),
+            "routes": [dict(r, city=r.get("city", r["destination"])) for r in cfg["routes"]],
+        }
+        self.state = load(STATE, {})
+        self.history = load(HISTORY, {})
+        self.sent = load(SENT, {})
+
+    def step(self, wait=0):
+        """Один проход: сообщения, затем (если пора) проверка цен, затем сохранение."""
+        changed = process_messages(self.tg, self.token, self.cfg, self.settings, self.state, wait)
+        now = datetime.now(timezone.utc)
+        last = self.state.get("last_check")
+        due = not last or now - datetime.fromisoformat(last) >= timedelta(
+            minutes=self.cfg["check_every_minutes"] - 5)
+        if due or changed:
+            check_prices(self.tg, self.token, self.cfg, self.settings, self.history, self.sent, now)
+            self.state["last_check"] = now.isoformat()
+            week_ago = now - timedelta(days=7)
+            self.sent = {k: v for k, v in self.sent.items() if datetime.fromisoformat(v) >= week_ago}
+        save(SETTINGS, self.settings)
+        save(STATE, self.state)
+        save(HISTORY, self.history)
+        save(SENT, self.sent)
+
+
 def main():
-    token = os.environ["TRAVELPAYOUTS_TOKEN"]
-    tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
-
-    cfg = load(CONFIG, {})
-    settings = load(SETTINGS, None) or {
-        "origin": cfg["origin"],
-        "origin_name": cfg.get("origin_name", cfg["origin"]),
-        "routes": [dict(r, city=r.get("city", r["destination"])) for r in cfg["routes"]],
-    }
-    state = load(STATE, {})
-    history = load(HISTORY, {})
-    sent = load(SENT, {})
-    now = datetime.now(timezone.utc)
-
-    settings_changed = process_messages(tg, token, cfg, settings, state)
-
-    last = state.get("last_check")
-    due = not last or now - datetime.fromisoformat(last) >= timedelta(minutes=cfg["check_every_minutes"] - 5)
-    if due or settings_changed:
-        check_prices(tg, token, cfg, settings, history, sent, now)
-        state["last_check"] = now.isoformat()
-
-    week_ago = now - timedelta(days=7)
-    sent = {k: v for k, v in sent.items() if datetime.fromisoformat(v) >= week_ago}
-    save(SETTINGS, settings)
-    save(STATE, state)
-    save(HISTORY, history)
-    save(SENT, sent)
+    bot = Bot()
+    if not SERVE:
+        bot.step()
+        return
+    print("Бот запущен и ждёт сообщений", flush=True)
+    while True:
+        try:
+            bot.step(wait=50)
+        except Exception as e:  # noqa: BLE001
+            print(f"loop error: {e}", file=sys.stderr, flush=True)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
