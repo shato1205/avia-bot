@@ -10,3 +10,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -u probe/probe.py
+        env:
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
