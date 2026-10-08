@@ -504,13 +504,16 @@ def parse_back(text, today):
 def pick_back_screen(item):
     i = item["id"]
     text = (f"↩️ {item['city']}: когда летим обратно?\n\nСейчас: {back_text(item)}.\n\n"
-            "Выбери срок или напиши:\n"
-            "• 12 — через 12 дней\n"
-            "• 10-14 — через 10–14 дней\n"
-            "• 25.12 — точная дата\n"
-            "• 20.12-28.12 — любой день в эти даты")
+            "Выбери срок кнопкой или нажми «✏️ Вписать свою дату».")
     btns = [(label, f"iy:{i}:{lo}-{hi}") for label, lo, hi in BACK_PRESETS]
-    return text, rows(btns, 3) + [[("⬅️ Отмена", f"i:{i}")]]
+    return text, rows(btns, 3) + [[("✏️ Вписать свою дату", f"ie:{i}")], [("⬅️ Отмена", f"i:{i}")]]
+
+
+BACK_HINT = ("Напиши, когда тебе нужно обратно:\n"
+             "• 25.12 — точная дата\n"
+             "• 20.12-28.12 — любой день в эти даты\n"
+             "• 12 — через 12 дней после вылета\n"
+             "• 10-14 — через 10–14 дней после вылета")
 
 
 def brief(o):
@@ -1793,7 +1796,8 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
 
     # Карточка направления
-    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "ib", "iy", "iv", "iz", "in", "iq", "ix"):
+    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "ib", "ie", "iy", "iv", "iz", "in", "iq",
+                 "ix"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -1834,6 +1838,11 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         elif cmd == "ib":
             state["awaiting"] = {"type": "item_back", "id": item_id}
             edit(*pick_back_screen(item))
+            return False
+        elif cmd == "ie":
+            state["awaiting"] = {"type": "item_back", "id": item_id}
+            edit(f"↩️ {item['city']}: {BACK_HINT[0].lower()}{BACK_HINT[1:]}",
+                 [[("⬅️ Назад", f"ib:{item_id}")]])
             return False
         elif cmd == "iy":
             lo, _, hi = extra.partition("-")
