@@ -167,7 +167,7 @@ def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=Tr
         "sorting": "price",
         "one_way": "true" if one_way else "false",
         "direct": "true" if direct else "false",
-        "limit": 5,
+        "limit": 30,  # с запасом: часть билетов отсеется из-за долгих пересадок
         "token": token,
     }
     if return_at:
@@ -179,12 +179,136 @@ def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=Tr
     return data.get("data", [])
 
 
-def route_offers(token, origin, route, cfg):
+def route_offers(token, origin, route, cfg, comfort_filter=True):
     offers = []
     for month in months(cfg["months_ahead"]):
         offers += fetch_cheapest(token, origin, route["destination"], month,
                                  direct=route.get("direct", False))
-    return offers
+    return comfort(offers, route.get("max_hours")) if comfort_filter else offers
+
+
+# ---------- Удобство: пересадки, время в пути, багаж ----------
+
+AIRLINES = {
+    "SU": "Аэрофлот", "S7": "S7", "U6": "Уральские авиалинии", "UT": "ЮТэйр", "DP": "Победа",
+    "WZ": "Red Wings", "5N": "Smartavia", "N4": "Nordwind", "ZF": "Azur Air", "2S": "Southwind",
+    "Y7": "NordStar", "DV": "SCAT", "C6": "Centrum Air", "HY": "Uzbekistan Airways",
+    "KC": "Air Astana", "J2": "AZAL", "CZ": "China Southern", "CA": "Air China",
+    "MU": "China Eastern", "HU": "Hainan Airlines", "EK": "Emirates", "FZ": "flydubai",
+    "QR": "Qatar Airways", "EY": "Etihad", "TK": "Turkish Airlines", "PC": "Pegasus",
+    "VF": "AJet", "G9": "Air Arabia", "W5": "Mahan Air", "TG": "Thai Airways",
+    "VN": "Vietnam Airlines", "VJ": "VietJet", "FD": "Thai AirAsia", "AK": "AirAsia",
+    "J9": "Jazeera Airways", "XY": "flynas", "OV": "SalamAir", "6E": "IndiGo", "UL": "SriLankan",
+    "AI": "Air India", "MS": "EgyptAir", "B2": "Belavia", "XQ": "SunExpress", "IR": "Iran Air",
+}
+# Лоукостеры: в самый дешёвый тариф багаж обычно не входит.
+LOWCOST = {"DP", "G9", "3L", "PC", "VF", "FZ", "XY", "J9", "OV", "VJ", "FD", "AK", "D7", "TR",
+           "3K", "JQ", "5J", "6E", "SG", "DD", "SL", "QG", "7C", "MM", "9C", "XQ", "W6", "FR",
+           "U2", "HV", "VY", "FS"}
+AIRPORT_CITIES = {
+    "SVO": "Москва", "DME": "Москва", "VKO": "Москва", "LED": "Петербург", "KZN": "Казань",
+    "SVX": "Екатеринбург", "OVB": "Новосибирск", "KJA": "Красноярск", "IKT": "Иркутск",
+    "VVO": "Владивосток", "AER": "Сочи", "MRV": "Минводы", "OGZ": "Владикавказ", "UFA": "Уфа",
+    "KUF": "Самара", "ROV": "Ростов", "KRR": "Краснодар", "MCX": "Махачкала", "GRV": "Грозный",
+    "MSQ": "Минск", "TAS": "Ташкент", "SKD": "Самарканд", "ALA": "Алматы", "NQZ": "Астана",
+    "FRU": "Бишкек", "OSS": "Ош", "DYU": "Душанбе", "GYD": "Баку", "EVN": "Ереван",
+    "TBS": "Тбилиси", "IST": "Стамбул", "SAW": "Стамбул", "AYT": "Анталья", "DXB": "Дубай",
+    "DWC": "Дубай", "SHJ": "Шарджа", "AUH": "Абу-Даби", "DOH": "Доха", "BAH": "Бахрейн",
+    "MCT": "Маскат", "KWI": "Кувейт", "RUH": "Эр-Рияд", "JED": "Джидда", "IKA": "Тегеран",
+    "CAI": "Каир", "HRG": "Хургада", "DEL": "Дели", "BOM": "Мумбаи", "CMB": "Коломбо",
+    "MLE": "Мале", "CAN": "Гуанчжоу", "SZX": "Шэньчжэнь", "HAK": "Хайкоу", "WUH": "Ухань",
+    "PEK": "Пекин", "PKX": "Пекин", "PVG": "Шанхай", "SHA": "Шанхай", "CTU": "Чэнду",
+    "TFU": "Чэнду", "KMG": "Куньмин", "XIY": "Сиань", "URC": "Урумчи", "HKG": "Гонконг",
+    "BKK": "Бангкок", "DMK": "Бангкок", "HKT": "Пхукет", "SGN": "Хошимин", "HAN": "Ханой",
+    "DAD": "Дананг", "CXR": "Нячанг", "KUL": "Куала-Лумпур", "SIN": "Сингапур",
+    "DPS": "Бали", "CGK": "Джакарта", "MNL": "Манила", "ICN": "Сеул", "NRT": "Токио",
+}
+AUTO_EXTRA_MIN = 600  # «авто»: не дольше самого быстрого варианта + 10 часов на каждую сторону
+HOURS_STEPS = [None, 12, 16, 20, 24, 30, 0]  # None — авто, 0 — любое время в пути
+
+
+def travel_minutes(o):
+    """Время в пути от вылета до прилёта с пересадками (для туда-обратно — обе стороны)."""
+    return int(o.get("duration") or o.get("duration_to") or 0)
+
+
+def comfort(offers, max_hours, legs=1):
+    """Отсеивает билеты с долгими пересадками. max_hours: None — авто, 0 — не отсеивать."""
+    timed = [travel_minutes(o) for o in offers if travel_minutes(o)]
+    if max_hours == 0 or not timed:
+        return offers
+    limit = max_hours * 60 * legs if max_hours else min(timed) + AUTO_EXTRA_MIN * legs
+    return [o for o in offers if not travel_minutes(o) or travel_minutes(o) <= limit]
+
+
+def hours_label(max_hours):
+    return {None: "авто", 0: "любое"}.get(max_hours, f"до {max_hours} ч")
+
+
+def hours_text(max_hours):
+    if max_hours is None:
+        return "авто — отсеиваю билеты, где лететь на 10+ часов дольше самого быстрого"
+    if max_hours == 0:
+        return "любое — показываю все пересадки"
+    return f"не дольше {max_hours} ч в одну сторону"
+
+
+def fmt_minutes(m):
+    hours, minutes = divmod(m, 60)
+    return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+
+
+def transfer_cities(o):
+    """Города пересадок «туда»: аэропорты зашиты в ссылку Aviasales (…SVOCANHKT_…)."""
+    m = re.search(r"[?&]t=[A-Z0-9]{2}\d+([A-Z]{6,})_", o.get("link", ""))
+    if not m:
+        return []
+    codes = [m.group(1)[i:i + 3] for i in range(0, len(m.group(1)) - 2, 3)]
+    return [AIRPORT_CITIES.get(c, c) for c in codes[1:1 + o.get("transfers", 0)]]
+
+
+def trip_details(o):
+    """«✈️ Аэрофлот · прямой · в пути 9 ч 30 мин» + пометка про багаж у лоукостеров."""
+    code = o.get("airline", "")
+    parts = [f"✈️ {AIRLINES.get(code, code)}" if code else "✈️"]
+    transfers = o.get("transfers", 0)
+    if o.get("return_at"):
+        back = o.get("return_transfers", 0)
+        parts.append("прямые" if transfers + back == 0 else f"пересадок: туда {transfers}, обратно {back}")
+        if travel_minutes(o):
+            parts.append(f"в пути всего {fmt_minutes(travel_minutes(o))}")
+    else:
+        if transfers == 0:
+            parts.append("прямой")
+        else:
+            where = ", ".join(transfer_cities(o))
+            parts.append(f"пересадок: {transfers}" + (f" ({where})" if where else ""))
+        if travel_minutes(o):
+            parts.append(f"в пути {fmt_minutes(travel_minutes(o))}")
+    line = " · ".join(parts)
+    if code in LOWCOST:
+        line += "\n🧳 Лоукостер: багаж, скорее всего, за доплату"
+    return line
+
+
+def item_offers(token, kind, item, cfg):
+    """(все билеты, билеты без долгих пересадок) для направления или подбора."""
+    if kind == "route":
+        all_offers = route_offers(token, item["origin"], item, cfg, comfort_filter=False)
+        return all_offers, comfort(all_offers, item.get("max_hours"))
+    all_offers = filter_offers(token, item["origin"], item, comfort_filter=False)
+    return all_offers, comfort(all_offers, item.get("max_hours"), 2 if item.get("round_trip") else 1)
+
+
+def skipped_note(all_offers, offers):
+    """Про отсеянные билеты: «дешевле есть, но 31 ч в пути»."""
+    best = min(o["price"] for o in offers) if offers else None
+    cheaper = [o for o in all_offers if o not in offers and (best is None or o["price"] < best)]
+    if not cheaper:
+        return ""
+    o = min(cheaper, key=lambda x: x["price"])
+    return (f"💤 Дешевле есть: {fmt_price(o['price'])} ₽, но в пути {fmt_minutes(travel_minutes(o))} "
+            "— такие не показываю")
 
 
 def find_deals(route, offers, history, cfg, now):
@@ -207,21 +331,28 @@ def find_deals(route, offers, history, cfg, now):
     return deals
 
 
-def filter_offers(token, origin, f):
-    return fetch_cheapest(token, origin, f["destination"], f["depart"], f.get("return"),
-                          one_way=not f.get("round_trip"), direct=f.get("direct", False))
+def filter_offers(token, origin, f, comfort_filter=True):
+    offers = fetch_cheapest(token, origin, f["destination"], f["depart"], f.get("return"),
+                            one_way=not f.get("round_trip"), direct=f.get("direct", False))
+    if not comfort_filter:
+        return offers
+    return comfort(offers, f.get("max_hours"), 2 if f.get("round_trip") else 1)
 
 
 def offer_link(offer):
     return "https://www.aviasales.ru" + offer.get("link", "")
 
 
+def short_date(iso):
+    """2026-12-06T23:15:00+03:00 → «06.12 в 23:15» (или «06.12», если времени нет)."""
+    text = f"{iso[8:10]}.{iso[5:7]}"
+    return text + f" в {iso[11:16]}" if len(iso) >= 16 else text
+
+
 def offer_line(offer, origin_name, route):
-    dep = offer["departure_at"][:10]
-    stops = offer.get("transfers", 0) + offer.get("return_transfers", 0)
-    stops_txt = "прямой" if stops == 0 else f"пересадок: {stops}"
-    ret = f", обратно {offer['return_at'][:10]}" if offer.get("return_at") else ""
-    return f"{origin_name} → {route['city']}, вылет {dep}{ret}, {stops_txt}\n{offer_link(offer)}"
+    ret = f", обратно {short_date(offer['return_at'])}" if offer.get("return_at") else ""
+    return (f"{origin_name} → {route['city']}, вылет {short_date(offer['departure_at'])}{ret}\n"
+            f"{trip_details(offer)}\n{offer_link(offer)}")
 
 
 def format_alert(route, offer, reason, origin_name):
@@ -382,16 +513,15 @@ def prices_now(token, cfg, settings, origin=None):
     for origin_name, pairs in groups:
         lines.append(f"\n🛫 Вылет: {origin_name}")
         for kind, item in pairs:
-            if kind == "route":
-                offers, title = route_offers(token, item["origin"], item, cfg), item["name"]
-            else:
-                offers, title = filter_offers(token, item["origin"], item), "🎯 " + filter_text(item)
+            title = item["name"] if kind == "route" else "🎯 " + filter_text(item)
+            all_offers, offers = item_offers(token, kind, item, cfg)
+            note = skipped_note(all_offers, offers)
             if not offers:
-                lines.append(f"{title}: билетов не нашёл")
+                lines.append(f"{title}: билетов не нашёл" + (f"\n{note}" if note else ""))
                 continue
             best = min(offers, key=lambda o: o["price"])
             lines.append(f"{title}: {fmt_price(best['price'])} ₽\n"
-                         f"{offer_line(best, origin_name, item)}")
+                         f"{offer_line(best, origin_name, item)}" + (f"\n{note}" if note else ""))
     if trains:
         lines.append("\n" + train_prices(settings))
     return "\n".join(lines)
@@ -1013,6 +1143,7 @@ def item_screen(settings, item_id, note=""):
     if item.get("last_price"):
         lines.append(last_price_line(item))
     lines.append("Только прямые рейсы ✈️" if item.get("direct") else "С пересадками тоже")
+    lines.append("⏱ Время в пути: " + hours_text(item.get("max_hours")))
     lines.append("⏸ На паузе: не присылаю уведомления" if item.get("paused") else "✅ Слежу")
 
     buttons = [
@@ -1028,7 +1159,8 @@ def item_screen(settings, item_id, note=""):
         buttons.append(row)
     buttons += [
         [("✈️ Только прямые: " + ("вкл" if item.get("direct") else "выкл"), f"ic:{i}"),
-         ("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
+         ("⏱ В пути: " + hours_label(item.get("max_hours")), f"ih:{i}")],
+        [("▶️ Возобновить" if item.get("paused") else "⏸ Пауза", f"iz:{i}")],
         [("🔎 Цена сейчас", f"in:{i}"), ("🗑 Удалить", f"iq:{i}")],
         [(f"⬅️ {item['origin_name']}", f"o:{item['origin']}")],
     ]
@@ -1447,7 +1579,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
         edit(*home_screen(settings))  # мастер устарел (например, после перезапуска)
 
     # Карточка направления
-    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "iv", "iz", "in", "iq", "ix"):
+    elif cmd in ("i", "ip", "it", "id", "ia", "ir", "ic", "ih", "iv", "iz", "in", "iq", "ix"):
         item_id, _, extra = arg.partition(":")
         kind, item = find_item(settings, item_id)
         if not item:
@@ -1485,6 +1617,14 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             item["round_trip"] = not item.get("round_trip")
         elif cmd == "ic":
             item["direct"] = not item.get("direct")
+        elif cmd == "ih":
+            steps = HOURS_STEPS
+            current = item.get("max_hours")
+            item["max_hours"] = steps[(steps.index(current) + 1) % len(steps) if current in steps else 0]
+            if item["max_hours"] is None:
+                item.pop("max_hours")
+            item.pop("last_price", None)
+            note = "✅ Время в пути: " + hours_text(item.get("max_hours")) + "\n"
         elif cmd == "iv":
             cars = list(CARS)
             item["car"] = cars[(cars.index(item.get("car", "any")) + 1) % len(cars)]
@@ -1515,17 +1655,25 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             return False
         elif cmd == "in":
             tg.send("🔎 Ищу цены…")
-            offers = (route_offers(token, item["origin"], item, cfg) if kind == "route"
-                      else filter_offers(token, item["origin"], item))
+            all_offers, offers = item_offers(token, kind, item, cfg)
             remember_price(item, offers, datetime.now(timezone.utc))
-            if offers:
-                best = min(offers, key=lambda o: o["price"])
-                tg.send(f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n"
-                        f"{offer_line(best, item['origin_name'], item)}",
-                        [[("🎫 Купить билет", offer_link(best))],
-                         [("⬅️ К направлению", f"i:{item_id}")]])
-            else:
-                tg.send(f"{item['city']}: билетов не нашёл 😔", [[("⬅️ К направлению", f"i:{item_id}")]])
+            back = [[("⬅️ К направлению", f"i:{item_id}")]]
+            note = skipped_note(all_offers, offers)
+            if not offers:
+                tg.send(f"{item['city']}: билетов не нашёл 😔" + (f"\n\n{note}" if note else ""), back)
+                return False
+            best = min(offers, key=lambda o: o["price"])
+            text = f"💰 {item['city']}: {fmt_price(best['price'])} ₽\n{offer_line(best, item['origin_name'], item)}"
+            buttons = [[("🎫 Купить билет", offer_link(best))]]
+            # Самый быстрый вариант, если он заметно быстрее самого дешёвого.
+            fast = min(offers, key=lambda o: (travel_minutes(o) or 10 ** 6, o["price"]))
+            if fast is not best and travel_minutes(fast) and travel_minutes(best) - travel_minutes(fast) >= 120:
+                text += (f"\n\n⚡ Быстрее: {fmt_price(fast['price'])} ₽\n"
+                         f"{offer_line(fast, item['origin_name'], item)}")
+                buttons.append([("⚡ Купить быстрый", offer_link(fast))])
+            if note:
+                text += f"\n\n{note}"
+            tg.send(text, buttons + back)
             return False
         elif cmd == "iq":
             edit(f"Удалить {item_label(kind, item)}?",
@@ -1537,7 +1685,7 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
                    else origin_screen(settings, item["origin"])))
             return False
         edit(*item_screen(settings, item_id, note))
-        return cmd in ("ip", "ir", "ic", "iv", "ia")
+        return cmd in ("ip", "ir", "ic", "ih", "iv", "ia")
 
     # Цены
     elif cmd in ("p", "pa"):
