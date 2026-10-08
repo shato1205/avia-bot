@@ -14,6 +14,8 @@ import re
 import statistics
 import sys
 import time
+import uuid
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -29,13 +31,12 @@ SENT = ROOT / "data" / "sent.json"
 PRICES_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 PLACES_URL = "https://autocomplete.travelpayouts.com/places2"
 
-BTN_FROM = "🛫 Откуда лечу"
-BTN_ADD = "➕ Добавить направление"
-BTN_LIST = "📋 Мои направления"
-BTN_REMOVE = "➖ Удалить направление"
+BTN_HOME = "🏠 Меню"
 BTN_PRICES = "💰 Цены сейчас"
-BTN_FILTER = "🎯 Подбор по датам"
-MENU = [[BTN_FROM, BTN_PRICES], [BTN_ADD, BTN_FILTER], [BTN_LIST, BTN_REMOVE]]
+MENU = [[BTN_HOME, BTN_PRICES]]
+# Кнопки из старой версии меню: могут остаться на клавиатуре до первого ответа бота.
+OLD_BUTTONS = {"🛫 Откуда лечу", "➕ Добавить направление", "📋 Мои направления",
+               "➖ Удалить направление", "🎯 Подбор по датам"}
 
 
 def load(path, default):
@@ -74,10 +75,28 @@ class Telegram:
         with urllib.request.urlopen(url, data=body, timeout=http_timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def send(self, text):
-        keyboard = {"keyboard": MENU, "resize_keyboard": True}
+    @staticmethod
+    def _markup(buttons):
+        """buttons: [[(текст, callback_data), ...], ...] → кнопки под сообщением."""
+        if buttons is None:
+            return {"keyboard": MENU, "resize_keyboard": True}
+        return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row]
+                                    for row in buttons]}
+
+    def send(self, text, buttons=None):
         self.call("sendMessage", chat_id=self.chat_id, text=text,
-                  reply_markup=keyboard, disable_web_page_preview="true")
+                  reply_markup=self._markup(buttons), disable_web_page_preview="true")
+
+    def edit(self, message_id, text, buttons):
+        try:
+            self.call("editMessageText", chat_id=self.chat_id, message_id=message_id, text=text,
+                      reply_markup=self._markup(buttons), disable_web_page_preview="true")
+        except urllib.error.HTTPError as e:
+            if e.code != 400:  # 400 — текст не изменился, это нормально
+                raise
+
+    def answer(self, callback_id, text=""):
+        self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)
 
     def updates(self, offset, wait=0):
         """wait > 0 — long polling: ждём новых сообщений до wait секунд."""
@@ -240,10 +259,18 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
 
 
 def ensure_origins(settings):
-    """Старые настройки: направления без своего города вылета получают общий."""
+    """Дополняет старые настройки: город вылета и id у каждого направления, список городов."""
+    origins = settings.setdefault("origins", [])
+    known = {o["code"] for o in origins}
     for item in settings["routes"] + settings.setdefault("filters", []):
         item.setdefault("origin", settings["origin"])
         item.setdefault("origin_name", settings["origin_name"])
+        item.setdefault("id", uuid.uuid4().hex[:8])
+        if item["origin"] not in known:
+            origins.append({"code": item["origin"], "name": item["origin_name"]})
+            known.add(item["origin"])
+    if settings["origin"] not in known:
+        origins.insert(0, {"code": settings["origin"], "name": settings["origin_name"]})
 
 
 def grouped_items(settings):
@@ -261,13 +288,14 @@ def grouped_items(settings):
     return [groups[o] for o in order if o in groups]
 
 
-def numbered_items(settings):
-    return [pair for _, pairs in grouped_items(settings) for pair in pairs]
-
-
-def prices_now(token, cfg, settings):
+def prices_now(token, cfg, settings, origin=None):
     lines = [f"💰 Самые дешёвые билеты на {cfg['months_ahead']} мес.:"]
-    for origin_name, pairs in grouped_items(settings):
+    groups = grouped_items(settings)
+    if origin:
+        groups = [g for g in groups if g[1][0][1]["origin"] == origin]
+    if not groups:
+        return "Направлений пока нет, добавь их в меню 🏠"
+    for origin_name, pairs in groups:
         lines.append(f"\n🛫 Вылет: {origin_name}")
         for kind, item in pairs:
             if kind == "route":
@@ -281,28 +309,6 @@ def prices_now(token, cfg, settings):
             lines.append(f"{title}: {fmt_price(best['price'])} ₽\n"
                          f"{offer_line(best, origin_name, item)}")
     return "\n".join(lines)
-
-
-# ---------- Команды ----------
-
-def routes_text(settings):
-    groups = grouped_items(settings)
-    if not groups:
-        return (f"Вылет из: {settings['origin_name']}\n"
-                "Направлений пока нет. Нажми «➕ Добавить направление».")
-    lines, i = [], 0
-    for origin_name, pairs in groups:
-        lines.append(f"\n🛫 Вылет: {origin_name}")
-        for kind, item in pairs:
-            i += 1
-            if kind == "route":
-                limit = (f"до {fmt_price(item['max_price'])} ₽" if item.get("max_price")
-                         else "только резкие падения")
-                lines.append(f"{i}. {item['name']}, {limit}")
-            else:
-                lines.append(f"{i}. 🎯 {filter_text(item)}")
-    lines.append(f"\nГород вылета для новых направлений: {settings['origin_name']}.")
-    return "\n".join(lines).strip()
 
 
 # ---------- Подбор по датам ----------
@@ -424,7 +430,8 @@ def add_filter(settings, text):
             replies.append("❌ " + place)
             continue
         item = dict(f, name=place_name(place), city=place["name"], destination=place["code"],
-                    origin=settings["origin"], origin_name=settings["origin_name"])
+                    origin=settings["origin"], origin_name=settings["origin_name"],
+                    id=uuid.uuid4().hex[:8])
         settings.setdefault("filters", []).append(item)
         replies.append(f"✅ Добавил подбор: {filter_text(item)}")
         changed = True
@@ -444,15 +451,22 @@ def split_price(text):
     return m.group(1).strip(), price
 
 
+def select_origin(settings, code):
+    for o in settings["origins"]:
+        if o["code"] == code:
+            settings["origin"], settings["origin_name"] = o["code"], o["name"]
+            return True
+    return False
+
+
 def set_origin(settings, text):
     place = find_place(text)
     if isinstance(place, str):
         return place, False
-    settings["origin"] = place["code"]
-    settings["origin_name"] = place["name"]
-    return (f"✅ Город вылета: {place['name']} ({place['code']}).\n"
-            "Новые направления и подборы буду добавлять для вылета отсюда, "
-            "старые направления из других городов остаются."), True
+    if not any(o["code"] == place["code"] for o in settings["origins"]):
+        settings["origins"].append({"code": place["code"], "name": place["name"]})
+    select_origin(settings, place["code"])
+    return f"✅ Город вылета {place['name']} добавлен.", False
 
 
 def add_route(settings, text):
@@ -467,123 +481,220 @@ def add_route(settings, text):
         if isinstance(place, str):
             replies.append("❌ " + place)
             continue
-        limit = f"дешевле {fmt_price(price)} ₽" if price else "при резком падении цены"
+        limit = (f"сообщу, когда билет будет дешевле {fmt_price(price)} ₽" if price
+                 else "сообщу о резком падении цены")
         existing = [r for r in settings["routes"]
                     if r["destination"] == place["code"] and r["origin"] == settings["origin"]]
         if existing:
             existing[0]["max_price"] = price
-            replies.append(f"✅ {existing[0]['name']}: теперь сообщу, когда билет будет {limit}.")
+            replies.append(f"✅ {existing[0]['name']}: теперь {limit}.")
         else:
             name = place_name(place)
             settings["routes"].append({"name": name, "city": place["name"],
                                        "destination": place["code"], "max_price": price,
                                        "origin": settings["origin"],
-                                       "origin_name": settings["origin_name"]})
-            replies.append(f"✅ Добавил {name}: сообщу, когда билет будет {limit}.")
+                                       "origin_name": settings["origin_name"],
+                                       "id": uuid.uuid4().hex[:8]})
+            replies.append(f"✅ Добавил {name}: {limit}.")
         changed = True
     return "\n".join(replies) or "Напиши город, например: Пхукет 20000", changed
 
 
-def remove_route(settings, text):
-    if not text.strip().isdigit():
-        return "Напиши номер направления из списка.", False
-    items = numbered_items(settings)
-    i = int(text.strip()) - 1
-    if not 0 <= i < len(items):
-        return "Нет направления с таким номером.", False
-    kind, item = items[i]
-    if kind == "route":
-        settings["routes"].remove(item)
-        return f"🗑 Удалил {item['name']} (вылет: {item['origin_name']}).", True
-    settings["filters"].remove(item)
-    return f"🗑 Удалил подбор: {filter_text(item)} (вылет: {item['origin_name']}).", True
-
-
 HELP = (
     "Я слежу за ценами на авиабилеты и пишу, когда находится дешёвый билет.\n\n"
-    "Можно нажимать кнопки меню или писать сразу одной строкой:\n"
-    "• откуда Санкт-Петербург\n"
+    "Всё настраивается кнопками в меню 🏠. А ещё можно писать одной строкой:\n"
+    "• откуда Казань\n"
     "• добавить Пхукет 20000, Бали 35000\n"
     "• подбор Пхукет 15.12-25.12 до 60000\n"
-    "• подбор Бали декабрь до 70000 прямой\n"
-    "• удалить 2"
+    "Новые направления добавляются в город вылета, который открыт в меню."
 )
 SERVE = "--serve" in sys.argv
 if not SERVE:
     HELP += "\n\nЯ отвечаю не мгновенно, а при очередной проверке (раз в ~30 минут)."
 
+ADD_PROMPT = ("Напиши город и максимальную цену:\n"
+              "• Пхукет 20000\n"
+              "• Пхукет 20000, Бали 35000 — у каждого своя цена\n"
+              "• Пхукет, Бангкок, Нячанг 25000 — одна цена на всех\n"
+              "Без цены сообщу только о резком падении.")
+FILTER_PROMPT = ("Напиши город, даты и максимальную цену за билет:\n"
+                 "• Пхукет 15.12-25.12 до 60000 — туда-обратно\n"
+                 "• Стамбул 20.11 до 8000 — в одну сторону\n"
+                 "• Бали декабрь до 70000 — туда-обратно, вылет в декабре\n"
+                 "• Пхукет, Бангкок 15.12-25.12 до 60000 — несколько городов\n"
+                 "Добавь «прямой», если нужны рейсы без пересадок.")
+
+
+# ---------- Экраны меню ----------
+
+def k(n):
+    return f"{round(n / 1000)}к" if n >= 1000 else str(n)
+
+
+def items_of(settings, code):
+    return ([("route", r) for r in settings["routes"] if r["origin"] == code]
+            + [("filter", f) for f in settings.get("filters", []) if f["origin"] == code])
+
+
+def origin_name(settings, code):
+    return next((o["name"] for o in settings["origins"] if o["code"] == code), code)
+
+
+def home_screen(settings):
+    lines = ["✈️ Главное меню\n", "Выбери город вылета, чтобы посмотреть и настроить направления:"]
+    buttons = []
+    for o in settings["origins"]:
+        items = items_of(settings, o["code"])
+        n_routes = sum(1 for kind, _ in items if kind == "route")
+        n_filters = len(items) - n_routes
+        lines.append(f"🛫 {o['name']}: направлений {n_routes}, подборов {n_filters}")
+        buttons.append([(f"🛫 {o['name']}", f"o:{o['code']}")])
+    buttons.append([("➕ Добавить город вылета", "neworigin")])
+    buttons.append([("💰 Цены по всем городам", "pa")])
+    return "\n".join(lines), buttons
+
+
+def origin_screen(settings, code):
+    name = origin_name(settings, code)
+    items = items_of(settings, code)
+    routes = [r for kind, r in items if kind == "route"]
+    filters = [f for kind, f in items if kind == "filter"]
+    lines = [f"🛫 Вылет: {name}\n", "📍 Направления — сообщу, когда билет подешевеет:"]
+    for r in routes:
+        limit = f"до {fmt_price(r['max_price'])} ₽" if r.get("max_price") else "резкие падения"
+        lines.append(f"• {r['name']} — {limit}")
+    if not routes:
+        lines.append("пока нет")
+    lines.append("\n🎯 Подборы по датам:")
+    for f in filters:
+        lines.append("• " + filter_text(f))
+    if not filters:
+        lines.append("пока нет")
+    buttons = [
+        [("➕ Направление", f"a:{code}"), ("🎯 Подбор по датам", f"f:{code}")],
+        [("💰 Цены сейчас", f"p:{code}"), ("🗑 Удалить", f"d:{code}")],
+        [("⬅️ Все города", "home")],
+    ]
+    return "\n".join(lines), buttons
+
+
+def delete_screen(settings, code):
+    name = origin_name(settings, code)
+    buttons = []
+    for kind, item in items_of(settings, code):
+        if kind == "route":
+            label = f"❌ {item['city']}" + (f" до {k(item['max_price'])}" if item.get("max_price") else "")
+        else:
+            dates = item["depart"][8:] + "." + item["depart"][5:7] if len(item["depart"]) == 10 \
+                else "в " + MONTH_IN[int(item["depart"][5:])]
+            if item.get("return") and len(item["return"]) == 10:
+                dates += f"–{item['return'][8:]}.{item['return'][5:7]}"
+            label = f"❌ 🎯 {item['city']} {dates} до {k(item['max_price'])}"
+        buttons.append([(label[:60], f"r:{item['id']}")])
+    buttons.append([(f"🗑 Удалить город {name} целиком", f"x:{code}")])
+    buttons.append([("⬅️ Назад", f"o:{code}")])
+    return f"🗑 Вылет: {name}\nНажми на то, что нужно удалить:", buttons
+
+
+def back_button(settings, code):
+    if code:
+        return [[(f"⬅️ {origin_name(settings, code)}", f"o:{code}")]]
+    return [[("⬅️ В меню", "home")]]
+
+
+# ---------- Обработка сообщений и кнопок ----------
 
 def handle(text, state, settings, tg, token, cfg):
-    """Обрабатывает одно сообщение. Возвращает True, если настройки изменились."""
+    """Обрабатывает текстовое сообщение. Возвращает True, если появились новые направления."""
     text = text.strip()
     low = text.lower()
     awaiting = state.pop("awaiting", None)
 
-    if low in ("/start", "/help", "меню", "помощь"):
+    if low in ("/start", "/help", "помощь"):
         tg.send(HELP)
+        tg.send(*home_screen(settings))
         return False
-    if text == BTN_FROM:
-        state["awaiting"] = "origin"
-        tg.send(f"Сейчас вылет из: {settings['origin_name']}.\nНапиши город, откуда хочешь улететь. "
-                "После этого новые направления будут добавляться для него, "
-                "а старые останутся в своих городах.")
-        return False
-    if text == BTN_ADD:
-        state["awaiting"] = "add"
-        tg.send("Напиши город и максимальную цену, например: Пхукет 20000\n"
-                "Можно сразу несколько через запятую:\n"
-                "• Пхукет 20000, Бали 35000, Дубай 12000\n"
-                "• Пхукет, Бангкок, Нячанг 25000 — одна цена на всех\n"
-                "Без цены буду сообщать только о резких падениях.")
-        return False
-    if text == BTN_FILTER:
-        state["awaiting"] = "filter"
-        tg.send("Напиши город, даты и максимальную цену за билет:\n"
-                "• Пхукет 15.12-25.12 до 60000 — туда-обратно в эти даты\n"
-                "• Стамбул 20.11 до 8000 — в одну сторону\n"
-                "• Бали декабрь до 70000 — туда-обратно с вылетом в декабре\n"
-                "• Пхукет, Бангкок 15.12-25.12 до 60000 — сразу несколько городов\n"
-                "Добавь «прямой», если нужны только рейсы без пересадок.")
-        return False
-    if text == BTN_REMOVE:
-        if not numbered_items(settings):
-            tg.send(routes_text(settings))
-            return False
-        state["awaiting"] = "remove"
-        tg.send(routes_text(settings) + "\n\nНапиши номер, который удалить.")
-        return False
-    if text == BTN_LIST:
-        tg.send(routes_text(settings))
+    if low in ("меню", "/menu") or text == BTN_HOME or text in OLD_BUTTONS:
+        tg.send(*home_screen(settings))
         return False
     if text == BTN_PRICES:
-        tg.send(prices_now(token, cfg, settings))
+        tg.send("🔎 Ищу цены…")
+        tg.send(prices_now(token, cfg, settings), back_button(settings, None))
         return False
 
-    for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("подбор ", "filter"), ("удалить ", "remove")):
+    for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("подбор ", "filter")):
         if low.startswith(prefix):
             awaiting, text = action, text[len(prefix):]
             break
 
-    actions = {"origin": set_origin, "add": add_route, "filter": add_filter, "remove": remove_route}
+    actions = {"origin": set_origin, "add": add_route, "filter": add_filter}
     if awaiting in actions:
         reply, changed = actions[awaiting](settings, text)
         tg.send(reply)
+        if "✅" in reply:
+            tg.send(*origin_screen(settings, settings["origin"]))
         return changed
 
-    tg.send("Не понял 🤔 Нажми кнопку в меню.\n\n" + HELP)
+    tg.send("Не понял 🤔 Открой меню кнопкой «🏠 Меню» внизу.")
     return False
+
+
+def handle_button(data, message_id, state, settings, tg, token, cfg):
+    """Обрабатывает нажатие кнопки под сообщением."""
+    state.pop("awaiting", None)
+    cmd, _, arg = data.partition(":")
+    if cmd == "home":
+        tg.edit(message_id, *home_screen(settings))
+    elif cmd == "o" and select_origin(settings, arg):
+        tg.edit(message_id, *origin_screen(settings, arg))
+    elif cmd == "a" and select_origin(settings, arg):
+        state["awaiting"] = "add"
+        tg.send(f"🛫 Вылет: {settings['origin_name']}\n" + ADD_PROMPT, back_button(settings, arg))
+    elif cmd == "f" and select_origin(settings, arg):
+        state["awaiting"] = "filter"
+        tg.send(f"🛫 Вылет: {settings['origin_name']}\n" + FILTER_PROMPT, back_button(settings, arg))
+    elif cmd == "neworigin":
+        state["awaiting"] = "origin"
+        tg.send("Напиши город, откуда хочешь улетать, например: Казань", back_button(settings, None))
+    elif cmd in ("p", "pa"):
+        tg.send("🔎 Ищу цены…")
+        tg.send(prices_now(token, cfg, settings, arg or None), back_button(settings, arg or None))
+    elif cmd == "d":
+        tg.edit(message_id, *delete_screen(settings, arg))
+    elif cmd == "r":
+        for key in ("routes", "filters"):
+            for item in settings[key]:
+                if item["id"] == arg:
+                    settings[key].remove(item)
+                    tg.edit(message_id, *delete_screen(settings, item["origin"]))
+                    return
+        tg.edit(message_id, *home_screen(settings))
+    elif cmd == "x":
+        settings["routes"] = [r for r in settings["routes"] if r["origin"] != arg]
+        settings["filters"] = [f for f in settings["filters"] if f["origin"] != arg]
+        settings["origins"] = [o for o in settings["origins"] if o["code"] != arg]
+        if settings["origin"] == arg and settings["origins"]:
+            select_origin(settings, settings["origins"][0]["code"])
+        tg.edit(message_id, *home_screen(settings))
+    else:
+        tg.edit(message_id, *home_screen(settings))
 
 
 def process_messages(tg, token, cfg, settings, state, wait=0):
     changed = False
     for upd in tg.updates(state.get("offset", 0), wait):
         state["offset"] = upd["update_id"] + 1
-        msg = upd.get("message") or {}
+        cq = upd.get("callback_query")
+        msg = (cq or {}).get("message") or upd.get("message") or {}
         # Слушаемся только владельца бота.
-        if str(msg.get("chat", {}).get("id")) != tg.chat_id or "text" not in msg:
+        if str(msg.get("chat", {}).get("id")) != tg.chat_id:
             continue
         try:
-            changed |= handle(msg["text"], state, settings, tg, token, cfg)
+            if cq:
+                tg.answer(cq["id"])
+                handle_button(cq.get("data", ""), msg["message_id"], state, settings, tg, token, cfg)
+            elif "text" in msg:
+                changed |= handle(msg["text"], state, settings, tg, token, cfg)
         except Exception as e:  # noqa: BLE001
             print(f"handle error: {e}", file=sys.stderr)
             tg.send("Что-то пошло не так, попробуй ещё раз.")
