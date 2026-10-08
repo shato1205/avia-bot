@@ -1,0 +1,36 @@
+{
+ "origin": "MOW",
+ "origin_name": "Москва",
+ "routes": [
+  {
+   "name": "ТАИЛАНД (Пхукет)",
+   "destination": "HKT",
+   "max_price": 25000,
+   "city": "Пхукет"
+  },
+  {
+   "name": "ТАИЛАНД (Бангкок)",
+   "destination": "BKK",
+   "max_price": 25000,
+   "city": "Бангкок"
+  },
+  {
+   "name": "ВЬЕТНАМ (Нячанг)",
+   "destination": "CXR",
+   "max_price": 25000,
+   "city": "Нячанг"
+  },
+  {
+   "name": "ТУРЦИЯ (Анталья)",
+   "destination": "AYT",
+   "max_price": 10000,
+   "city": "Анталья"
+  },
+  {
+   "name": "ОАЭ (Дубай)",
+   "destination": "DXB",
+   "max_price": 12000,
+   "city": "Дубай"
+  }
+ ]
+}
