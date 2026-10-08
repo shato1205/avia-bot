@@ -34,7 +34,8 @@ BTN_ADD = "➕ Добавить направление"
 BTN_LIST = "📋 Мои направления"
 BTN_REMOVE = "➖ Удалить направление"
 BTN_PRICES = "💰 Цены сейчас"
-MENU = [[BTN_FROM, BTN_PRICES], [BTN_ADD, BTN_REMOVE], [BTN_LIST]]
+BTN_FILTER = "🎯 Подбор по датам"
+MENU = [[BTN_FROM, BTN_PRICES], [BTN_ADD, BTN_FILTER], [BTN_LIST, BTN_REMOVE]]
 
 
 def load(path, default):
@@ -116,17 +117,21 @@ def months(n):
     return out
 
 
-def fetch_cheapest(token, origin, destination, month):
+def fetch_cheapest(token, origin, destination, month, return_at=None, one_way=True, direct=False):
+    """month — YYYY-MM или YYYY-MM-DD. При one_way=False цена за туда-обратно."""
     params = {
         "origin": origin,
         "destination": destination,
         "departure_at": month,
         "currency": "rub",
         "sorting": "price",
-        "one_way": "true",
+        "one_way": "true" if one_way else "false",
+        "direct": "true" if direct else "false",
         "limit": 5,
         "token": token,
     }
+    if return_at:
+        params["return_at"] = return_at
     data = http_get_json(PRICES_URL + "?" + urllib.parse.urlencode(params))
     if not data.get("success"):
         print(f"API error {origin}->{destination} {month}: {data}", file=sys.stderr)
@@ -161,12 +166,18 @@ def find_deals(route, offers, history, cfg, now):
     return deals
 
 
+def filter_offers(token, origin, f):
+    return fetch_cheapest(token, origin, f["destination"], f["depart"], f.get("return"),
+                          one_way=not f.get("round_trip"), direct=f.get("direct", False))
+
+
 def offer_line(offer, origin_name, route):
     dep = offer["departure_at"][:10]
-    stops = offer.get("transfers", 0)
+    stops = offer.get("transfers", 0) + offer.get("return_transfers", 0)
     stops_txt = "прямой" if stops == 0 else f"пересадок: {stops}"
+    ret = f", обратно {offer['return_at'][:10]}" if offer.get("return_at") else ""
     link = "https://www.aviasales.ru" + offer.get("link", "")
-    return f"{origin_name} → {route['city']}, вылет {dep}, {stops_txt}\n{link}"
+    return f"{origin_name} → {route['city']}, вылет {dep}{ret}, {stops_txt}\n{link}"
 
 
 def format_alert(route, offer, reason, origin_name):
@@ -204,6 +215,26 @@ def check_prices(tg, token, cfg, settings, history, sent, now):
         cutoff = (now - timedelta(days=90)).isoformat()
         history[key] = [p for p in route_history if p["ts"] >= cutoff]
         print(f"{key}: минимум {cheapest} ₽")
+
+    for f in list(settings.get("filters", [])):
+        if filter_expired(f, now.date()):
+            settings["filters"].remove(f)
+            tg.send(f"⌛ Даты прошли, убрал подбор: {filter_text(f)}")
+            continue
+        offers = [o for o in filter_offers(token, origin, f) if o["price"] <= f["max_price"]]
+        if not offers:
+            continue
+        o = min(offers, key=lambda x: x["price"])
+        sent_key = f"F|{origin}-{f['destination']}|{o['departure_at'][:10]}|{o.get('return_at', '')[:10]}|{o['price']}"
+        last = sent.get(sent_key)
+        if last and now - datetime.fromisoformat(last) < timedelta(hours=cfg["realert_hours"]):
+            continue
+        kind = " туда-обратно" if f.get("round_trip") else ""
+        tg.send(f"🎯 ГОША СРОЧНО {f['name']} {fmt_price(o['price'])} ₽{kind}\n"
+                f"{offer_line(o, settings['origin_name'], f)}\n"
+                f"Подбор: {filter_text(f)}")
+        sent[sent_key] = now.isoformat()
+        alerts += 1
     print(f"Отправлено алертов: {alerts}")
 
 
@@ -217,19 +248,144 @@ def prices_now(token, cfg, settings):
         best = min(offers, key=lambda o: o["price"])
         lines.append(f"\n{route['name']}: {fmt_price(best['price'])} ₽\n"
                      f"{offer_line(best, settings['origin_name'], route)}")
+    for f in settings.get("filters", []):
+        offers = filter_offers(token, settings["origin"], f)
+        if not offers:
+            lines.append(f"\n🎯 {filter_text(f)}: билетов не нашёл")
+            continue
+        best = min(offers, key=lambda o: o["price"])
+        lines.append(f"\n🎯 {filter_text(f)}: {fmt_price(best['price'])} ₽\n"
+                     f"{offer_line(best, settings['origin_name'], f)}")
     return "\n".join(lines)
 
 
 # ---------- Команды ----------
 
 def routes_text(settings):
-    if not settings["routes"]:
+    filters = settings.get("filters", [])
+    if not settings["routes"] and not filters:
         return "Направлений пока нет. Нажми «➕ Добавить направление»."
-    lines = [f"Вылет из: {settings['origin_name']}", "Направления:"]
+    lines = [f"Вылет из: {settings['origin_name']}"]
+    if settings["routes"]:
+        lines.append("Направления:")
     for i, r in enumerate(settings["routes"], 1):
         limit = f"до {fmt_price(r['max_price'])} ₽" if r.get("max_price") else "только резкие падения"
         lines.append(f"{i}. {r['name']}, {limit}")
+    if filters:
+        lines.append("Подбор по датам:")
+    for i, f in enumerate(filters, len(settings["routes"]) + 1):
+        lines.append(f"{i}. 🎯 {filter_text(f)}")
     return "\n".join(lines)
+
+
+# ---------- Подбор по датам ----------
+
+MONTH_FORMS = {
+    1: "январь января январе янв", 2: "февраль февраля феврале фев",
+    3: "март марта марте мар", 4: "апрель апреля апреле апр", 5: "май мая мае",
+    6: "июнь июня июне июн", 7: "июль июля июле июл", 8: "август августа августе авг",
+    9: "сентябрь сентября сентябре сен сент", 10: "октябрь октября октябре окт",
+    11: "ноябрь ноября ноябре ноя", 12: "декабрь декабря декабре дек",
+}
+MONTHS = {form: num for num, forms in MONTH_FORMS.items() for form in forms.split()}
+MONTH_IN = ["", "январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе",
+            "сентябре", "октябре", "ноябре", "декабре"]
+
+
+def _future_date(day, month, year, today):
+    d = date(year or today.year, month, day)
+    if not year and d < today:
+        d = d.replace(year=d.year + 1)
+    return d
+
+
+def _future_month(month, today):
+    year = today.year + (1 if month < today.month else 0)
+    return f"{year}-{month:02d}"
+
+
+def parse_filter(text, today):
+    """«Пхукет 15.12-25.12 до 60000 прямой» → (город, dict фильтра) или (None, ошибка)."""
+    low = " " + text.lower() + " "
+    direct = bool(re.search(r"прям|без пересад", low))
+    one_way_word = bool(re.search(r"в одну сторону|только туда", low))
+    low = re.sub(r"прям\w*|без пересадок|в одну сторону|только туда|туда[- ]обратно", " ", low)
+
+    dates = []
+    for m in re.finditer(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", low):
+        year = int(m.group(3)) if m.group(3) else None
+        if year and year < 100:
+            year += 2000
+        try:
+            dates.append(_future_date(int(m.group(1)), int(m.group(2)), year, today))
+        except ValueError:
+            return None, f"Не понял дату «{m.group(0)}». Пиши так: 15.12"
+    low = re.sub(r"\d{1,2}\.\d{1,2}(?:\.\d{2,4})?", " ", low)
+
+    months = []
+    for word in re.findall(r"[а-яё]+", low):
+        if word in MONTHS:
+            months.append(MONTHS[word])
+            low = re.sub(rf"\b{word}\b", " ", low, count=1)
+
+    city, price = split_price(re.sub(r"\bдо\b|\s[-–—]+\s", " ", low))
+    city = city.strip(" ,")
+    if not city:
+        return None, "Не вижу город. Пример: Пхукет 15.12-25.12 до 60000"
+    if not price:
+        return None, "Укажи максимальную цену, например: Пхукет 15.12-25.12 до 60000"
+
+    f = {"max_price": price, "direct": direct}
+    if dates:
+        f["depart"] = dates[0].isoformat()
+        if len(dates) > 1:
+            if dates[1] < dates[0]:
+                return None, "Дата обратно получилась раньше даты вылета. Проверь даты."
+            f["return"] = dates[1].isoformat()
+        f["round_trip"] = len(dates) > 1
+    elif months:
+        f["depart"] = _future_month(months[0], today)
+        if len(months) > 1:
+            f["return"] = _future_month(months[1], today)
+        f["round_trip"] = not one_way_word
+    else:
+        return None, "Укажи даты или месяц. Пример: Пхукет 15.12-25.12 до 60000"
+    return city, f
+
+
+def filter_text(f):
+    def fmt(d):
+        if len(d) == 7:
+            return "в " + MONTH_IN[int(d[5:])]
+        return f"{d[8:]}.{d[5:7]}"
+    dates = f"вылет {fmt(f['depart'])}"
+    if f.get("return"):
+        dates += f", обратно {fmt(f['return'])}"
+    elif f.get("round_trip"):
+        dates += ", туда-обратно"
+    direct = ", прямой" if f.get("direct") else ""
+    return f"{f['name']}: {dates}{direct}, до {fmt_price(f['max_price'])} ₽"
+
+
+def filter_expired(f, today):
+    d = f["depart"]
+    if len(d) == 7:
+        return d < today.strftime("%Y-%m")
+    return d < today.isoformat()
+
+
+def add_filter(settings, text):
+    city, f = parse_filter(text, date.today())
+    if city is None:
+        return f, False
+    place = find_place(city)
+    if isinstance(place, str):
+        return place, False
+    country = place["country"].upper()
+    f.update(name=f"{country} ({place['name']})" if country else place["name"].upper(),
+             city=place["name"], destination=place["code"])
+    settings.setdefault("filters", []).append(f)
+    return f"✅ Добавил подбор: {filter_text(f)}\nСообщу, как только найду такой билет.", True
 
 
 def split_price(text):
@@ -274,10 +430,14 @@ def remove_route(settings, text):
     if not text.strip().isdigit():
         return "Напиши номер направления из списка.", False
     i = int(text.strip()) - 1
-    if not 0 <= i < len(settings["routes"]):
-        return "Нет направления с таким номером.", False
-    r = settings["routes"].pop(i)
-    return f"🗑 Удалил {r['name']}.", True
+    routes, filters = settings["routes"], settings.get("filters", [])
+    if 0 <= i < len(routes):
+        r = routes.pop(i)
+        return f"🗑 Удалил {r['name']}.", True
+    if 0 <= i - len(routes) < len(filters):
+        f = filters.pop(i - len(routes))
+        return f"🗑 Удалил подбор: {filter_text(f)}", True
+    return "Нет направления с таким номером.", False
 
 
 HELP = (
@@ -285,6 +445,8 @@ HELP = (
     "Можно нажимать кнопки меню или писать сразу одной строкой:\n"
     "• откуда Санкт-Петербург\n"
     "• добавить Пхукет 20000\n"
+    "• подбор Пхукет 15.12-25.12 до 60000\n"
+    "• подбор Бали декабрь до 70000 прямой\n"
     "• удалить 2"
 )
 SERVE = "--serve" in sys.argv
@@ -310,8 +472,16 @@ def handle(text, state, settings, tg, token, cfg):
         tg.send("Напиши город и максимальную цену, например: Пхукет 20000\n"
                 "Без цены буду сообщать только о резких падениях.")
         return False
+    if text == BTN_FILTER:
+        state["awaiting"] = "filter"
+        tg.send("Напиши город, даты и максимальную цену за билет:\n"
+                "• Пхукет 15.12-25.12 до 60000 — туда-обратно в эти даты\n"
+                "• Стамбул 20.11 до 8000 — в одну сторону\n"
+                "• Бали декабрь до 70000 — туда-обратно с вылетом в декабре\n"
+                "Добавь «прямой», если нужны только рейсы без пересадок.")
+        return False
     if text == BTN_REMOVE:
-        if not settings["routes"]:
+        if not settings["routes"] and not settings.get("filters"):
             tg.send(routes_text(settings))
             return False
         state["awaiting"] = "remove"
@@ -324,12 +494,12 @@ def handle(text, state, settings, tg, token, cfg):
         tg.send(prices_now(token, cfg, settings))
         return False
 
-    for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("удалить ", "remove")):
+    for prefix, action in (("откуда ", "origin"), ("добавить ", "add"), ("подбор ", "filter"), ("удалить ", "remove")):
         if low.startswith(prefix):
             awaiting, text = action, text[len(prefix):]
             break
 
-    actions = {"origin": set_origin, "add": add_route, "remove": remove_route}
+    actions = {"origin": set_origin, "add": add_route, "filter": add_filter, "remove": remove_route}
     if awaiting in actions:
         reply, changed = actions[awaiting](settings, text)
         tg.send(reply)
