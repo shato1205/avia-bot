@@ -2,11 +2,15 @@ name: Проверка цен
 
 on:
   schedule:
-    - cron: "17 */2 * * *"   # каждые 2 часа
+    - cron: "*/30 * * * *"   # каждые 30 минут: ответы на команды; цены раз в 2 часа
   workflow_dispatch:          # кнопка «Run workflow» для ручного запуска
 
 permissions:
   contents: write
+
+concurrency:
+  group: price-bot
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -16,16 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Проверить цены
+      - name: Проверить сообщения и цены
         env:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_prices.py
-      - name: Сохранить историю цен
+      - name: Сохранить данные
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || git commit -m "Обновить историю цен"
+          git diff --cached --quiet || git commit -m "Обновить данные бота"
+          git pull --rebase origin main
           git push
