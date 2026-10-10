@@ -1641,15 +1641,32 @@ def add_route(settings, text):
     return "\n".join(replies) or "Напиши город, например: Пхукет 20000", changed
 
 
-NEWS_ID = "2026-10-08-saved"  # поменять, когда будет что рассказать о новом
-NEWS = ("🆕 Бот обновился:\n\n"
-        "⭐ Отложенные билеты. Под уведомлениями и под «🔎 Цена сейчас» есть кнопка «⭐ Отложить», "
-        "а внизу — кнопка «⭐ Отложенные»: там билеты можно купить, проверить цену или убрать. "
-        "Я сам слежу за их ценой и напишу, если отложенный билет подешевеет.\n\n"
-        "✈️ В «🎯 Подбор по датам» даты выбираются в календаре. В карточке направления есть "
-        "«🕐 Время вылета» (утро, день, вечер, ночь) и «🧳 С багажом».\n\n"
-        "🚆 У поездов можно выбрать время отправления, а «Цена сейчас» показывает поезда "
-        "утром, днём, вечером и ночью.")
+# Что нового: каждый человек один раз получает записи, которых ещё не видел.
+NEWS_ITEMS = [
+    ("2026-10-08-saved",
+     "⭐ Отложенные билеты. Под уведомлениями и под «🔎 Цена сейчас» есть кнопка «⭐ Отложить», "
+     "а внизу — кнопка «⭐ Отложенные»: там билеты можно купить, проверить цену или убрать. "
+     "Я сам слежу за их ценой и напишу, если отложенный билет подешевеет.\n\n"
+     "✈️ В карточке направления есть «🕐 Время вылета» (утро, день, вечер, ночь) "
+     "и «🧳 С багажом».\n\n"
+     "🚆 У поездов можно выбрать время отправления, а «Цена сейчас» показывает поезда "
+     "утром, днём, вечером и ночью."),
+    ("2026-10-10-dates",
+     "📅 Дату вылета теперь выбираешь прямо при добавлении: «➕ Направление» → город → день "
+     "в календаре, весь месяц или «🗓 Любые даты». Потом «Когда обратно?» и порог цены.\n\n"
+     "У направлений, которые уже есть, нажми «📅 Вылет: любой день» в карточке, чтобы выбрать дату."),
+]
+NEWS_ID = NEWS_ITEMS[-1][0]
+
+
+def news_text(seen):
+    """Новости, которых человек ещё не видел (seen — id последней увиденной), или None."""
+    ids = [i for i, _ in NEWS_ITEMS]
+    if seen == NEWS_ID:
+        return None
+    start = ids.index(seen) + 1 if seen in ids else 0
+    return "🆕 Бот обновился:\n\n" + "\n\n".join(text for _, text in NEWS_ITEMS[start:])
+
 
 HELP = (
     "Я слежу за ценами на авиабилеты и билеты на поезда и пишу, когда находится дешёвый билет.\n\n"
@@ -1801,14 +1818,14 @@ def origin_screen(settings, code):
     items = items_of(settings, code)
     lines = [f"🛫 Вылет: {name}\n"]
     if items:
-        lines.append("📍 — сообщу, когда цена упадёт ниже порога\n"
-                     "🎯 — подбор на конкретные даты\n"
+        lines.append("📍 — любые даты: сообщу, когда цена упадёт ниже порога\n"
+                     "🎯 — конкретные даты вылета\n"
                      "Нажми на направление, чтобы изменить его.")
     else:
         lines.append("Направлений пока нет. Добавь первое кнопкой ниже 👇")
     buttons = [[(item_label(kind, item), f"i:{item['id']}")] for kind, item in items]
     buttons += [
-        [("➕ Направление", f"a:{code}"), ("🎯 Подбор по датам", f"f:{code}")],
+        [("➕ Направление", f"a:{code}")],
         [("💰 Цены сейчас", f"p:{code}"), ("🗑 Удалить город", f"xq:{code}")],
         [("⬅️ Все города", "home")],
     ]
@@ -1902,6 +1919,7 @@ def item_screen(settings, item_id, note=""):
     if kind == "route":
         country = item["name"].split(" (")[0].title() if " (" in item["name"] else ""
         lines.append(f"📍 {item['origin_name']} → {item['city']}" + (f" ({country})" if country else ""))
+        lines.append("Даты: " + ANY_DATES)
         lines.append(f"Сообщу, когда билет дешевле {fmt_price(item['max_price'])} ₽ "
                      "или резко подешевеет." if item.get("max_price")
                      else "Сообщу, когда билет резко подешевеет.")
@@ -1926,6 +1944,8 @@ def item_screen(settings, item_id, note=""):
          ("+ 1к", f"ip:{i}:1000"), ("+ 5к", f"ip:{i}:5000")],
         [("✏️ Своя цена", f"it:{i}")],
     ]
+    if kind == "route":
+        buttons.append([("📅 Вылет: любой день", f"id:{i}")])
     if kind == "filter":
         dep = item["depart"]
         if len(dep) == 10:
@@ -1975,8 +1995,13 @@ FLIGHT_BACK_HINT = ("Напиши дату вылета обратно, напр
 BACK_QUICK = [("Неделя", 7), ("10 дней", 10), ("2 недели", 14)]
 
 
-def pick_flight_dates_screen(title, prefix, cancel, nav, write, month=None):
-    """Когда вылет: календарь, весь месяц (гибкие даты), своя дата текстом."""
+ANY_DATES = "любой день в ближайшие 3 месяца"  # как months_ahead в config.json
+ANY_DATES_WORDS = ("любые", "любые даты", "любая", "любая дата", "любой день", "неважно",
+                   "не важно", "без даты", "без дат")
+
+
+def pick_flight_dates_screen(title, prefix, cancel, nav, write, month=None, any_cb=None):
+    """Когда вылет: календарь, весь месяц (гибкие даты), любые даты, своя дата текстом."""
     today = datetime.now(MSK).date()
     hi = today + timedelta(days=FLIGHT_DAYS_AHEAD)
     months_btns, d = [], today.replace(day=1)
@@ -1985,9 +2010,14 @@ def pick_flight_dates_screen(title, prefix, cancel, nav, write, month=None):
         d = (d + timedelta(days=32)).replace(day=1)
     text = (f"{title}: когда вылет?\n\nНажми на день в календаре. Даты гибкие — выбери месяц "
             "под календарём, найду самый дешёвый день в нём.")
+    extra = []
+    if any_cb:
+        text += (" Даты не важны — жми «🗓 Любые даты»: буду следить за ценами на каждый день "
+                 "в ближайшие 3 месяца.")
+        extra = [[("🗓 Любые даты", any_cb)]]
     return (text, calendar_rows(month or today, prefix, nav, today, hi)
             + [[("— или весь месяц —", "noop")]] + rows(months_btns, 3)
-            + [[("✏️ Вписать свою дату", write)], cancel])
+            + extra + [[("✏️ Вписать свою дату", write)], cancel])
 
 
 def pick_flight_back_screen(title, depart, prefix, cancel, nav, write, month=None):
@@ -2031,12 +2061,31 @@ def set_filter_back(item, back):
 
 
 def flight_dates_wizard_screen(wiz, month=None):
-    return pick_flight_dates_screen(f"🎯 {wiz['city']}", "wm:", wiz_cancel(wiz), "wk:", "we", month)
+    return pick_flight_dates_screen(f"✈️ {wiz['city']}", "wm:", wiz_cancel(wiz), "wk:", "we", month,
+                                    "wm:any" if wiz.get("any_ok") else None)
 
 
 def flight_back_wizard_screen(wiz, month=None):
-    return pick_flight_back_screen(f"🎯 {wiz['city']}", wiz["depart"], "wb:", wiz_cancel(wiz),
+    return pick_flight_back_screen(f"✈️ {wiz['city']}", wiz["depart"], "wb:", wiz_cancel(wiz),
                                    "wj:", "wf", month)
+
+
+# Что переносим, когда направление меняет даты (любые ↔ конкретные): остальные настройки те же.
+CARRY_FIELDS = ("name", "times", "back_times", "bag", "direct", "max_hours", "paused", "back")
+
+
+def redate_wizard(item, kind):
+    """Мастер, который заменит направление (тот же id) на такое же, но с другими датами."""
+    wiz = {"kind": "r", "origin": item["origin"], "dest": item["destination"],
+           "city": item["city"], "replace": item["id"],
+           "carry": {f: item[f] for f in CARRY_FIELDS if f in item}}
+    if item.get("max_price") and not item.get("round_trip"):
+        wiz["old_price"] = item["max_price"]  # цена за билет в одну сторону: можно оставить
+    if kind == "route":
+        wiz["any_ok"] = True
+    else:
+        wiz["depart"] = None  # подбор → любые даты
+    return wiz
 
 
 def filter_back_screen(item, month=None):
@@ -2046,12 +2095,21 @@ def filter_back_screen(item, month=None):
 
 
 def pick_trip_screen(wiz):
-    return (f"🎯 {wiz['city']}: билет нужен туда-обратно или в одну сторону?",
-            [[("🔁 Туда-обратно", "wt:rt"), ("➡️ В одну сторону", "wt:ow")],
-             [("⬅️ Отмена", f"o:{wiz['origin']}")]])
+    return (f"✈️ {wiz['city']}: билет нужен туда-обратно или в одну сторону?",
+            [[("🔁 Туда-обратно", "wt:rt"), ("➡️ В одну сторону", "wt:ow")], wiz_cancel(wiz)])
+
+
+def set_wiz_depart(wiz, depart):
+    """Вылет в мастере: None — любые даты (📍 направление), день или месяц — 🎯 подбор."""
+    wiz["kind"] = "r" if depart is None else "f"
+    wiz["depart"] = depart
+    wiz.pop("return", None)
+    wiz.pop("round_trip", None)  # для конкретных дат спросим про обратный билет
 
 
 def wiz_cancel(wiz):
+    if wiz.get("replace"):
+        return [("⬅️ Отмена", f"i:{wiz['replace']}")]
     return [("⬅️ Отмена", "t" if wiz["kind"] == "t" else f"o:{wiz['origin']}")]
 
 
@@ -2065,6 +2123,8 @@ def pick_price_screen(wiz, current=None):
     text += f"\n\nВыбери порог или напиши свою сумму, например {example}."
     btns = [(f"до {k(p)}", f"wp:{p}") for p in prices]
     buttons = rows(btns, 3)
+    if wiz.get("old_price") and not wiz.get("round_trip"):
+        buttons.insert(0, [(f"Оставить как было: до {k(wiz['old_price'])}", f"wp:{wiz['old_price']}")])
     if wiz["kind"] in ("r", "t"):
         buttons.append([("Без порога — только резкие падения", "wp:0")])
     buttons.append(wiz_cancel(wiz))
@@ -2196,10 +2256,14 @@ def wizard_current_price(token, cfg, settings, wiz):
         offers = train_trip_offers(wiz)
         return min((o["price"] for o in offers), default=None)
     try:
+        # Настройки, перенесённые из карточки (время вылета, багаж, прямые), тоже учитываем.
+        item = dict(wiz.get("carry", {}), destination=wiz["dest"])
         if wiz["kind"] == "r":
-            offers = route_offers(token, settings["origin"], {"destination": wiz["dest"]}, cfg)
+            offers = route_offers(token, wiz.get("origin") or settings["origin"], item, cfg)
         else:
-            offers = filter_offers(token, settings["origin"], dict(wiz, destination=wiz["dest"]))
+            item.update({f: wiz[f] for f in ("depart", "return", "round_trip") if f in wiz})
+            item["direct"] = item.get("direct") or wiz.get("direct", False)
+            offers = filter_offers(token, wiz.get("origin") or settings["origin"], item)
     except Exception as e:  # noqa: BLE001
         print(f"price error: {e}", file=sys.stderr)
         return None
@@ -2224,7 +2288,7 @@ def wizard_next(state, settings, tg, token, cfg, message_id=None):
     show = (lambda t, b: tg.edit(message_id, t, b)) if message_id else tg.send
     if wiz["kind"] == "t":
         return train_wizard_next(state, settings, tg, token, cfg, show)
-    if wiz["kind"] == "f" and "depart" not in wiz:
+    if "depart" not in wiz:  # самолёты: когда вылет (день, месяц или любые даты)
         state["awaiting"] = {"type": "wiz_dates"}
         return show(*flight_dates_wizard_screen(wiz))
     if wiz["kind"] == "f" and "round_trip" not in wiz:
@@ -2238,6 +2302,10 @@ def wizard_next(state, settings, tg, token, cfg, message_id=None):
 
     place = {"code": wiz["dest"], "name": wiz["city"], "country": wiz.get("country", "")}
     item = new_item_fields(settings, place)
+    if wiz.get("replace"):  # то же направление с новыми датами: убираем старое, id тот же
+        item["id"] = wiz["replace"]
+        settings["routes"] = [r for r in settings["routes"] if r["id"] != item["id"]]
+        settings["filters"] = [f for f in settings["filters"] if f["id"] != item["id"]]
     if wiz["kind"] == "r":
         item["max_price"] = wiz["price"] or None
         settings["routes"] = [r for r in settings["routes"]
@@ -2250,10 +2318,14 @@ def wizard_next(state, settings, tg, token, cfg, message_id=None):
         if wiz.get("return"):
             item["return"] = wiz["return"]
         settings["filters"].append(item)
+    item.update(wiz.get("carry", {}))
+    if wiz.get("direct"):  # «прямой» в датах, вписанных текстом
+        item["direct"] = True
     state.pop("wiz", None)
     state.pop("awaiting", None)
     state["changed"] = True
-    show(*item_screen(settings, item["id"], "✅ Добавлено! Я уже проверяю цены.\n"))
+    done = "✅ Сохранил новые даты!" if wiz.get("replace") else "✅ Добавлено!"
+    show(*item_screen(settings, item["id"], done + " Я уже проверяю цены.\n"))
 
 
 def train_dates_wizard_screen(wiz, month=None):
@@ -2442,11 +2514,20 @@ def handle(text, state, settings, tg, token, cfg):
         tg.send(*item_screen(settings, item["id"], "✅ Сохранил.\n"))
         return True
     if kind == "wiz_dates" and wiz:
+        if wiz.get("any_ok") and _norm(text) in ANY_DATES_WORDS:
+            if find_item(settings, wiz.get("replace"))[0] == "route":
+                state.pop("wiz")
+                tg.send(*item_screen(settings, wiz["replace"]))
+                return False
+            set_wiz_depart(wiz, None)
+            wizard_next(state, settings, tg, token, cfg)
+            return False
         fields = parse_dates(text, date.today())
         if isinstance(fields, str):
             state["awaiting"] = awaiting
             tg.send(fields)
             return False
+        set_wiz_depart(wiz, fields["depart"])
         wiz.update(fields)
         if not fields.get("return") and len(fields["depart"]) == 10:
             wiz.pop("round_trip", None)  # один день: спросим, нужен ли обратный билет
@@ -2496,6 +2577,10 @@ def handle(text, state, settings, tg, token, cfg):
                 return False
             item["max_price"] = amount
         else:
+            if _norm(text) in ANY_DATES_WORDS:  # подбор → направление на любые даты
+                state["wiz"] = redate_wizard(item, item_kind)
+                wizard_next(state, settings, tg, token, cfg)
+                return False
             fields = parse_dates(text, date.today())
             if isinstance(fields, str):
                 state["awaiting"] = awaiting
@@ -2571,6 +2656,8 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     # Мастер добавления
     elif cmd in ("a", "f") and select_origin(settings, arg):
         state["wiz"] = {"kind": "r" if cmd == "a" else "f", "origin": arg}
+        if cmd == "a":
+            state["wiz"]["any_ok"] = True  # на экране дат есть «🗓 Любые даты»
         state["awaiting"] = {"type": "wiz_city"}
         edit(*pick_city_screen(settings, state["wiz"]["kind"]))
     elif cmd == "ta":
@@ -2603,12 +2690,13 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
     elif cmd == "wd" and state.get("wiz", {}).get("kind") == "t":
         state["wiz"]["dates"] = None if arg == "any" else [arg, arg]
         wizard_next(state, settings, tg, token, cfg, message_id)
-    elif cmd == "wk" and state.get("wiz", {}).get("kind") == "f":
+    elif cmd == "wk" and state.get("wiz", {}).get("kind") in ("r", "f"):
         state["awaiting"] = {"type": "wiz_dates"}
         edit(*flight_dates_wizard_screen(state["wiz"], date.fromisoformat(arg + "-01")))
-    elif cmd == "we" and state.get("wiz", {}).get("kind") == "f":
+    elif cmd == "we" and state.get("wiz", {}).get("kind") in ("r", "f"):
         state["awaiting"] = {"type": "wiz_dates"}
-        edit(f"🎯 {state['wiz']['city']}: {FLIGHT_DATES_HINT[0].lower()}{FLIGHT_DATES_HINT[1:]}",
+        hint = FLIGHT_DATES_HINT + ("\n• любые — слежу за всеми днями" if state["wiz"].get("any_ok") else "")
+        edit(f"✈️ {state['wiz']['city']}: {hint[0].lower()}{hint[1:]}",
              [[("⬅️ К календарю", "wk:" + date.today().strftime("%Y-%m"))]])
     elif cmd in ("wj", "wf", "wb") and state.get("wiz", {}).get("kind") == "f" \
             and len(state["wiz"].get("depart", "")) == 10:
@@ -2624,16 +2712,19 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             if cmd == "wj":
                 edit(*flight_back_wizard_screen(wiz, date.fromisoformat(arg + "-01")))
             else:
-                edit(f"🎯 {wiz['city']}: {FLIGHT_BACK_HINT[0].lower()}{FLIGHT_BACK_HINT[1:]}",
+                edit(f"✈️ {wiz['city']}: {FLIGHT_BACK_HINT[0].lower()}{FLIGHT_BACK_HINT[1:]}",
                      [[("⬅️ К календарю", "wj:" + wiz["depart"][:7])]])
     elif cmd == "wc" and state.get("wiz"):
         code, name, country = next(d for d in POPULAR_DESTINATIONS if d[0] == arg)
         wizard_set_city(state, settings, {"code": code, "name": name, "country": country})
         wizard_next(state, settings, tg, token, cfg, message_id)
     elif cmd == "wm" and state.get("wiz"):
-        state["wiz"]["depart"] = arg
-        state["wiz"].pop("return", None)
-        state["wiz"].pop("round_trip", None)  # спросим про обратный билет
+        wiz = state["wiz"]
+        if arg == "any" and find_item(settings, wiz.get("replace"))[0] == "route":
+            state.pop("wiz")  # у направления и так любые даты
+            edit(*item_screen(settings, wiz["replace"]))
+            return False
+        set_wiz_depart(wiz, None if arg == "any" else arg)
         wizard_next(state, settings, tg, token, cfg, message_id)
     elif cmd == "wt" and state.get("wiz"):
         state["wiz"]["round_trip"] = arg == "rt"
@@ -2674,11 +2765,22 @@ def handle_button(data, message_id, state, settings, tg, token, cfg):
             month = date.fromisoformat(month + "-01")
             edit(*pick_flight_dates_screen(f"🎯 {item['city']}", f"ia:{item_id}:",
                                            [("⬅️ Отмена", f"i:{item_id}")], f"ik:{item_id}:",
-                                           f"iu:{item_id}", month))
+                                           f"iu:{item_id}", month, f"ia:{item_id}:any"))
+            return False
+        elif cmd == "id" and kind == "route":
+            # Выбрали дату у направления «любые даты»: дальше как при добавлении (обратно, порог).
+            state["wiz"] = redate_wizard(item, kind)
+            state["awaiting"] = {"type": "wiz_dates"}
+            edit(*flight_dates_wizard_screen(state["wiz"]))
+            return False
+        elif cmd == "ia" and kind == "filter" and extra == "any":
+            state["wiz"] = redate_wizard(item, kind)
+            wizard_next(state, settings, tg, token, cfg, message_id)
             return False
         elif cmd == "iu" and kind == "filter":
             state["awaiting"] = {"type": "item_dates", "id": item_id}
-            edit(f"🎯 {item['city']}: {FLIGHT_DATES_HINT[0].lower()}{FLIGHT_DATES_HINT[1:]}",
+            hint = FLIGHT_DATES_HINT + "\n• любые — слежу за всеми днями"
+            edit(f"🎯 {item['city']}: {hint[0].lower()}{hint[1:]}",
                  [[("⬅️ К календарю", f"id:{item_id}")]])
             return False
         elif cmd == "ia" and kind == "filter" and extra:
@@ -3172,10 +3274,11 @@ class Bot:
     def tell_news(self):
         """Один раз после обновления рассказываем, что нового (и обновляем кнопки внизу)."""
         for user in self.users.values():
-            if user.settings.get("news") == NEWS_ID:
+            text = news_text(user.settings.get("news"))
+            if not text:
                 continue
             try:
-                user.tg.send(NEWS)
+                user.tg.send(text)
                 user.settings["news"] = NEWS_ID
             except Exception as e:  # noqa: BLE001
                 print(f"news error {user.chat_id}: {e!r}", file=sys.stderr)
